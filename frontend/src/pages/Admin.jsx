@@ -1,6 +1,6 @@
 import { useState } from 'react'
-import { postCollect, postCollectToday, postTrain, postPredict, postBacktest, getHealth } from '../api'
-import { Settings, Download, Calendar, Brain, Target, BarChart3, Activity, Loader2, CheckCircle2, XCircle, BookOpen } from 'lucide-react'
+import { postCollect, postCollectToday, postTrain, postPredict, postBacktest, getHealth, postReset } from '../api'
+import { Settings, Download, Calendar, Brain, Target, BarChart3, Activity, Loader2, CheckCircle2, XCircle, BookOpen, Trash2 } from 'lucide-react'
 
 function ActionButton({ label, description, onClick, loading, result, icon: Icon, accent = 'racing' }) {
   const accents = {
@@ -181,6 +181,39 @@ export default function Admin() {
           icon={Activity}
           accent="racing"
         />
+
+        <div className="card-glass p-5 group hover:border-red-500/30 transition-all duration-300">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-xl bg-red-900/30 flex items-center justify-center flex-shrink-0">
+              <Trash2 className="w-4.5 h-4.5 text-red-400" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <h3 className="font-semibold text-white text-sm">Reinitialiser la base</h3>
+              <p className="text-xs text-dark-400 mt-1 leading-relaxed">Supprime toutes les donnees et recree les tables vides. Action irreversible.</p>
+            </div>
+          </div>
+          <button
+            onClick={() => { if (window.confirm('Supprimer TOUTES les donnees ? Cette action est irreversible.')) run('reset', postReset) }}
+            disabled={loading.reset}
+            className="mt-4 w-full px-4 py-2.5 rounded-xl text-white text-sm font-semibold bg-red-600 hover:bg-red-500 shadow-md hover:shadow-lg transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed hover:-translate-y-0.5 active:translate-y-0 flex items-center justify-center gap-2"
+          >
+            {loading.reset ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                En cours...
+              </>
+            ) : (
+              'Reinitialiser'
+            )}
+          </button>
+          {results.reset && (
+            <div className="mt-3">
+              <pre className="bg-dark-800/50 border border-dark-700/30 rounded-xl p-3 text-[11px] text-dark-300 overflow-auto max-h-40 font-mono">
+                {JSON.stringify(results.reset, null, 2)}
+              </pre>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Workflow Guide */}

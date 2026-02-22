@@ -51,3 +51,7 @@ export async function postPredict() {
 export async function postBacktest() {
   return fetchJSON('/backtest', { method: 'POST' })
 }
+
+export async function postReset() {
+  return fetchJSON('/reset', { method: 'POST' })
+}

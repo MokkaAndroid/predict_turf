@@ -150,6 +150,16 @@ async def health():
     return {"status": "ok", "model_loaded": predictor.model is not None}
 
 
+@app.post("/api/reset")
+async def reset_database():
+    """Supprime toutes les données et recrée les tables."""
+    from app.database import engine, Base
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+    return {"status": "ok", "message": "Base de données réinitialisée"}
+
+
 # ── Serve frontend static files (production) ────────────────────
 if STATIC_DIR.exists():
     app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")
