@@ -1,0 +1,53 @@
+const BASE = '/api'
+
+async function fetchJSON(url, options = {}) {
+  const res = await fetch(`${BASE}${url}`, options)
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  return res.json()
+}
+
+export async function getCoursesPassees(limit = 50, offset = 0, hippodrome = '') {
+  const params = new URLSearchParams({ limit, offset })
+  if (hippodrome) params.set('hippodrome', hippodrome)
+  return fetchJSON(`/courses/passees?${params}`)
+}
+
+export async function getCoursesAVenir(limit = 50) {
+  return fetchJSON(`/courses/a-venir?limit=${limit}`)
+}
+
+export async function getCourseDetail(id) {
+  return fetchJSON(`/course/${id}`)
+}
+
+export async function getBacktestingStats(mise = 1) {
+  return fetchJSON(`/backtesting/stats?mise=${mise}`)
+}
+
+export async function getPrevisionsJour() {
+  return fetchJSON('/previsions/jour')
+}
+
+export async function getHealth() {
+  return fetchJSON('/health')
+}
+
+export async function postCollect(start, end) {
+  return fetchJSON(`/collect?start=${start}&end=${end}`, { method: 'POST' })
+}
+
+export async function postCollectToday() {
+  return fetchJSON('/collect/today', { method: 'POST' })
+}
+
+export async function postTrain() {
+  return fetchJSON('/train', { method: 'POST' })
+}
+
+export async function postPredict() {
+  return fetchJSON('/predict', { method: 'POST' })
+}
+
+export async function postBacktest() {
+  return fetchJSON('/backtest', { method: 'POST' })
+}
