@@ -99,24 +99,31 @@ async def train_model(db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/predict")
 async def predict_all(db: AsyncSession = Depends(get_db)):
-    """Génère les prédictions pour toutes les courses à venir non encore prédites."""
-    stmt = select(Course).where(Course.statut == "A_VENIR")
+    """Génère les prédictions pour toutes les courses non encore prédites (A_VENIR + TERMINE)."""
+    stmt = select(Course).where(Course.statut.in_(["A_VENIR", "TERMINE"]))
     result = await db.execute(stmt)
     courses = result.scalars().all()
 
     count = 0
+    errors = 0
     for course in courses:
-        # Vérifier si des prédictions existent déjà
         pred_check = select(Prediction).where(Prediction.course_id == course.id)
         existing = await db.execute(pred_check)
         if existing.scalars().first():
             continue
 
-        await predictor.predict_and_save(db, course)
-        count += 1
+        try:
+            await predictor.predict_and_save(db, course)
+            count += 1
+        except Exception as e:
+            logger.error("Erreur prediction course %s: %s", course.id, e)
+            errors += 1
+
+        if count % 50 == 0 and count > 0:
+            await db.commit()
 
     await db.commit()
-    return {"status": "ok", "courses_predites": count}
+    return {"status": "ok", "courses_predites": count, "erreurs": errors}
 
 
 @app.post("/api/backtest")
