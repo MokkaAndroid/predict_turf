@@ -249,15 +249,20 @@ class PMUCollector:
         return count
 
     async def collect_range(self, start: date, end: date, only_plat: bool = True) -> int:
-        """Collecte les courses sur une plage de dates."""
+        """Collecte les courses sur une plage de dates, jour par jour avec gestion d'erreur."""
         total = 0
+        errors = []
         current = start
         while current <= end:
             logger.info("Collecte %s ...", current)
-            n = await self.collect_date(current, only_plat=only_plat)
-            logger.info("  → %d courses de plat insérées", n)
-            total += n
+            try:
+                n = await self.collect_date(current, only_plat=only_plat)
+                logger.info("  → %d courses de plat insérées", n)
+                total += n
+            except Exception as e:
+                logger.error("Erreur collecte %s : %s", current, e)
+                errors.append(str(current))
             current += timedelta(days=1)
             await asyncio.sleep(0.5)
-        logger.info("Total collecté : %d courses", total)
+        logger.info("Total collecté : %d courses (%d jours en erreur)", total, len(errors))
         return total

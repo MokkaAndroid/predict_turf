@@ -68,6 +68,9 @@ async def collect_data(
     try:
         count = await collector.collect_range(start_date, end_date, only_plat=True)
         return {"status": "ok", "courses_collectees": count}
+    except Exception as e:
+        logger.error("Erreur collecte: %s", e)
+        return {"status": "partial", "error": str(e)}
     finally:
         await collector.close()
 
@@ -80,6 +83,9 @@ async def collect_today():
     try:
         count = await collector.collect_date(today, only_plat=True)
         return {"status": "ok", "courses_collectees": count}
+    except Exception as e:
+        logger.error("Erreur collecte today: %s", e)
+        return {"status": "error", "error": str(e)}
     finally:
         await collector.close()
 
