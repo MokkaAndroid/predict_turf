@@ -242,6 +242,9 @@ export default function PrevisionsJour() {
                           <div className="flex items-center gap-3">
                             <span className="text-xl font-display font-bold text-stone-800 group-hover:text-racing-700 transition-colors">{p.cheval_nom}</span>
                             <span className="text-xs text-stone-400 bg-stone-100 px-2 py-0.5 rounded-lg font-mono">N{p.numero}</span>
+                            {p.top5_confiance && (
+                              <span className="text-[10px] font-bold px-2 py-1 rounded-lg bg-blue-100 text-blue-700 border border-blue-200 uppercase tracking-wider">Top 5</span>
+                            )}
                             {p.is_value_bet && (
                               <span className="text-[10px] font-bold px-2 py-1 rounded-lg bg-purple-100 text-purple-600 border border-purple-200 uppercase tracking-wider">Value Bet</span>
                             )}
@@ -292,7 +295,7 @@ export default function PrevisionsJour() {
             <div className="overflow-x-auto">
               <table className="w-full table-premium">
                 <thead>
-                  <tr><th>#</th><th>Heure</th><th>Hippodrome</th><th>Course</th><th>N</th><th>Cheval</th><th className="text-right">Cote</th><th className="text-right">Confiance</th><th className="text-center">VB</th></tr>
+                  <tr><th>#</th><th>Heure</th><th>Hippodrome</th><th>Course</th><th>N</th><th>Cheval</th><th className="text-right">Cote</th><th className="text-right">Confiance</th><th className="text-center">Top 5</th><th className="text-center">VB</th></tr>
                 </thead>
                 <tbody>
                   {filtered.map((p, idx) => (
@@ -305,6 +308,7 @@ export default function PrevisionsJour() {
                       <td className="font-semibold text-stone-800">{p.cheval_nom}</td>
                       <td className={`text-right font-mono font-bold ${p.cote <= 3 ? 'text-green-600' : p.cote <= 6 ? 'text-blue-600' : p.cote <= 10 ? 'text-gold-600' : 'text-red-500'}`}>{p.cote?.toFixed(1) || '-'}</td>
                       <td className={`text-right font-mono font-bold ${p.score_confiance >= 60 ? 'text-racing-600' : p.score_confiance >= 35 ? 'text-gold-600' : 'text-red-500'}`}>{p.score_confiance.toFixed(0)}%</td>
+                      <td className="text-center">{p.top5_confiance ? <span className="text-[10px] font-bold text-blue-700 bg-blue-100 px-2 py-0.5 rounded-lg">T5</span> : <span className="text-stone-300">-</span>}</td>
                       <td className="text-center">{p.is_value_bet ? <span className="text-[10px] font-bold text-purple-600 bg-purple-100 px-2 py-0.5 rounded-lg">VB</span> : <span className="text-stone-300">-</span>}</td>
                     </tr>
                   ))}

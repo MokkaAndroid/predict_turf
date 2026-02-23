@@ -47,7 +47,7 @@ export default function CoursesPassees() {
         <div className="overflow-x-auto">
           <table className="w-full table-premium">
             <thead>
-              <tr><th>Date</th><th>Hippodrome</th><th>Course</th><th>Distance</th><th>Favori predit</th><th className="text-center">Resultat</th><th className="text-right">Gain Gagnant</th><th className="text-right">Gain Place</th></tr>
+              <tr><th>Date</th><th>Hippodrome</th><th>Course</th><th>Distance</th><th>Favori predit</th><th className="text-center">Top 5</th><th className="text-center">Resultat</th><th className="text-right">Gain Gagnant</th><th className="text-right">Gain Place</th></tr>
             </thead>
             <tbody>
               {courses.map(c => (
@@ -57,6 +57,11 @@ export default function CoursesPassees() {
                   <td className="text-stone-400 font-mono text-xs">R{c.numero_reunion}C{c.numero_course}</td>
                   <td className="text-stone-400">{c.distance}m</td>
                   <td className="text-stone-600">{c.favori_nom || <span className="text-stone-300">-</span>}</td>
+                  <td className="text-center">
+                    {c.top5_confiance ? (
+                      <span className="inline-block px-2 py-0.5 rounded-lg text-[10px] font-bold bg-blue-100 text-blue-700 border border-blue-200">TOP 5</span>
+                    ) : <span className="text-stone-300">-</span>}
+                  </td>
                   <td className="text-center">
                     {c.prediction_correcte_gagnant != null ? (
                       <span className={`inline-block px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase tracking-wider ${

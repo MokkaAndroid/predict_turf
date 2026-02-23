@@ -24,6 +24,48 @@ from app.models import Course, Prediction
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+async def mark_top5_confiance(db: AsyncSession, target_date: date):
+    """Marque les 5 prédictions rang 1 avec la meilleure confiance pour un jour donné.
+    Réinitialise d'abord tous les flags du jour, puis active les 5 meilleurs."""
+    from datetime import datetime as dt, timedelta as td
+    day_start = dt.combine(target_date, dt.min.time())
+    day_end = dt.combine(target_date + td(days=1), dt.min.time())
+
+    # Récupérer toutes les courses du jour
+    stmt = select(Course).where(Course.date >= day_start, Course.date < day_end)
+    result = await db.execute(stmt)
+    courses = result.scalars().all()
+    course_ids = [c.id for c in courses]
+
+    if not course_ids:
+        return
+
+    # Reset tous les flags du jour
+    from sqlalchemy import update
+    await db.execute(
+        update(Prediction)
+        .where(Prediction.course_id.in_(course_ids))
+        .values(top5_confiance=False)
+    )
+
+    # Récupérer les prédictions rang 1 du jour, triées par confiance
+    pred_stmt = (
+        select(Prediction)
+        .where(
+            Prediction.course_id.in_(course_ids),
+            Prediction.rang_predit == 1,
+        )
+        .order_by(Prediction.score_confiance.desc())
+        .limit(5)
+    )
+    top5 = (await db.execute(pred_stmt)).scalars().all()
+    for pred in top5:
+        pred.top5_confiance = True
+
+    await db.flush()
+    logger.info("Top 5 confiance marquées pour le %s (%d prédictions)", target_date, len(top5))
+
 predictor = HippiquePredictor()
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -140,6 +182,10 @@ async def daily_update(db: AsyncSession = Depends(get_db)):
                 errors += 1
         await db.commit()
 
+        # 4. Marquer les top 5 confiance du jour
+        await mark_top5_confiance(db, today)
+        await db.commit()
+
     return {
         "status": "ok",
         "courses_mises_a_jour": update_result.get("updated", 0),
@@ -184,6 +230,16 @@ async def predict_all(db: AsyncSession = Depends(get_db)):
             await db.commit()
 
     await db.commit()
+
+    # Marquer les top 5 confiance pour chaque jour concerné
+    from collections import defaultdict as _defaultdict
+    jours = set()
+    for course in courses:
+        jours.add(course.date.date())
+    for jour in jours:
+        await mark_top5_confiance(db, jour)
+    await db.commit()
+
     return {"status": "ok", "courses_predites": count, "erreurs": errors}
 
 
@@ -211,6 +267,29 @@ async def backtest_all(db: AsyncSession = Depends(get_db)):
 
     await db.commit()
     return {"status": "ok", "courses_backtestees": count}
+
+
+@app.post("/api/mark-top5-history")
+async def mark_top5_history(db: AsyncSession = Depends(get_db)):
+    """Marque les top 5 confiance pour toutes les dates historiques (migration one-shot)."""
+    from collections import defaultdict as _dd
+    stmt = select(Course).order_by(Course.date)
+    result = await db.execute(stmt)
+    courses = result.scalars().all()
+
+    jours = set()
+    for c in courses:
+        jours.add(c.date.date())
+
+    count = 0
+    for jour in sorted(jours):
+        await mark_top5_confiance(db, jour)
+        count += 1
+        if count % 30 == 0:
+            await db.commit()
+
+    await db.commit()
+    return {"status": "ok", "jours_traites": count}
 
 
 @app.get("/api/health")

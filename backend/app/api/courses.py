@@ -51,6 +51,7 @@ async def courses_passees(
 
         favori_nom = None
         favori_confiance = None
+        is_top5 = False
         pred_gagnant = None
         pred_place = None
         gain_g = None
@@ -67,6 +68,7 @@ async def courses_passees(
                 cheval = cr.scalar_one_or_none()
                 favori_nom = cheval.nom if cheval else None
             favori_confiance = pred.score_confiance
+            is_top5 = pred.top5_confiance
             pred_gagnant = pred.resultat_gagnant
             pred_place = pred.resultat_place
             gain_g = pred.gain_gagnant
@@ -85,6 +87,7 @@ async def courses_passees(
             statut=c.statut,
             favori_nom=favori_nom,
             favori_confiance=favori_confiance,
+            top5_confiance=is_top5,
             prediction_correcte_gagnant=pred_gagnant,
             prediction_correcte_place=pred_place,
             gain_simule_gagnant=gain_g,
@@ -118,6 +121,7 @@ async def courses_a_venir(
 
         favori_nom = None
         favori_confiance = None
+        is_top5 = False
         if pred:
             partant_stmt = select(Partant).where(Partant.id == pred.partant_id)
             pr = await db.execute(partant_stmt)
@@ -128,6 +132,7 @@ async def courses_a_venir(
                 cheval = cr.scalar_one_or_none()
                 favori_nom = cheval.nom if cheval else None
             favori_confiance = pred.score_confiance
+            is_top5 = pred.top5_confiance
 
         items.append(CourseListSchema(
             id=c.id,
@@ -142,6 +147,7 @@ async def courses_a_venir(
             statut=c.statut,
             favori_nom=favori_nom,
             favori_confiance=favori_confiance,
+            top5_confiance=is_top5,
         ))
     return items
 
@@ -323,6 +329,7 @@ async def previsions_jour(
             probabilite=pred.probabilite,
             score_confiance=pred.score_confiance,
             is_value_bet=pred.is_value_bet,
+            top5_confiance=pred.top5_confiance,
             commentaire=pred.commentaire,
         ))
 
@@ -380,8 +387,8 @@ async def backtesting_stats(
 
 @router.get("/bilan-veille", response_model=BilanVeilleSummarySchema)
 async def bilan_veille(db: AsyncSession = Depends(get_db)):
-    """Bilan des 5 meilleures confiances de la veille : résultat et gains simulés
-    avec 1€ sur le gagnant et 4€ sur le placé par course."""
+    """Bilan des 5 confiances figées de la veille (top5_confiance=True) :
+    résultat et gains simulés avec 1€ sur le gagnant et 4€ sur le placé."""
     yesterday = date.today() - timedelta(days=1)
     yesterday_start = datetime.combine(yesterday, datetime.min.time())
     today_start = datetime.combine(date.today(), datetime.min.time())
@@ -397,16 +404,30 @@ async def bilan_veille(db: AsyncSession = Depends(get_db)):
     )
     result = await db.execute(stmt)
     courses = result.scalars().all()
+    course_ids = [c.id for c in courses]
+    course_map = {c.id: c for c in courses}
 
-    # Récupérer les prédictions rang 1 pour ces courses, triées par confiance
-    items = []
-    for course in courses:
-        pred_stmt = (
-            select(Prediction)
-            .where(Prediction.course_id == course.id, Prediction.rang_predit == 1)
+    if not course_ids:
+        return BilanVeilleSummarySchema(
+            date_veille=yesterday.strftime("%d/%m/%Y"),
+            bilans=[], total_mise=0, total_gain=0, profit=0,
         )
-        pred = (await db.execute(pred_stmt)).scalar_one_or_none()
-        if not pred:
+
+    # Récupérer uniquement les prédictions marquées top5_confiance
+    pred_stmt = (
+        select(Prediction)
+        .where(
+            Prediction.course_id.in_(course_ids),
+            Prediction.top5_confiance == True,
+        )
+        .order_by(Prediction.score_confiance.desc())
+    )
+    preds = (await db.execute(pred_stmt)).scalars().all()
+
+    items = []
+    for pred in preds:
+        course = course_map.get(pred.course_id)
+        if not course:
             continue
 
         partant = (await db.execute(
@@ -419,7 +440,6 @@ async def bilan_veille(db: AsyncSession = Depends(get_db)):
             select(Cheval).where(Cheval.id == partant.cheval_id)
         )).scalar_one_or_none()
 
-        # Déterminer le résultat
         if pred.resultat_gagnant:
             resultat = "gagnant"
         elif pred.resultat_place:
@@ -427,7 +447,6 @@ async def bilan_veille(db: AsyncSession = Depends(get_db)):
         else:
             resultat = "perdu"
 
-        # Gains simulés : 1€ gagnant, 4€ placé
         gain_g = (partant.rapport_gagnant or 0) - 1.0 if pred.resultat_gagnant else -1.0
         gain_p = ((partant.rapport_place or 0) * 4) - 4.0 if pred.resultat_place else -4.0
 
@@ -447,16 +466,12 @@ async def bilan_veille(db: AsyncSession = Depends(get_db)):
             gain_place=round(gain_p, 2),
         ))
 
-    # Trier par confiance décroissante, prendre les 5 meilleurs
-    items.sort(key=lambda x: x.score_confiance, reverse=True)
-    top5 = items[:5]
-
-    total_gain = sum(b.gain_gagnant + b.gain_place for b in top5)
-    total_mise = len(top5) * 5.0  # 1€ gagnant + 4€ placé par course
+    total_gain = sum(b.gain_gagnant + b.gain_place for b in items)
+    total_mise = len(items) * 5.0
 
     return BilanVeilleSummarySchema(
         date_veille=yesterday.strftime("%d/%m/%Y"),
-        bilans=top5,
+        bilans=items,
         total_mise=total_mise,
         total_gain=round(total_mise + total_gain, 2),
         profit=round(total_gain, 2),
@@ -465,63 +480,39 @@ async def bilan_veille(db: AsyncSession = Depends(get_db)):
 
 @router.get("/confiance/stats", response_model=ConfianceStatsSchema)
 async def confiance_stats(db: AsyncSession = Depends(get_db)):
-    """Stats historiques des top-5 confiance par jour :
-    taux gagnant/placé sur toute la profondeur d'historique."""
-    # Toutes les courses terminées avec prédictions backtestées
-    stmt = (
-        select(Course)
-        .where(Course.statut == "TERMINE")
-        .order_by(Course.date)
+    """Stats historiques basées sur le flag top5_confiance figé en base.
+    Taux gagnant/placé sur toute la profondeur d'historique."""
+    # Toutes les prédictions marquées top5_confiance avec résultat backtesté
+    pred_stmt = (
+        select(Prediction)
+        .where(
+            Prediction.top5_confiance == True,
+            Prediction.resultat_gagnant.is_not(None),
+        )
     )
-    result = await db.execute(stmt)
-    courses = result.scalars().all()
+    preds = (await db.execute(pred_stmt)).scalars().all()
 
-    # Grouper les courses par jour
-    from collections import defaultdict
-    courses_par_jour = defaultdict(list)
-    for c in courses:
-        jour = c.date.date()
-        courses_par_jour[jour].append(c)
-
-    # Pour chaque jour, prendre les 5 meilleures confiances
-    total = 0
+    total = len(preds)
     gagnant_ok = 0
     place_ok = 0
     profit_g = 0.0
     profit_p = 0.0
 
-    for jour, jour_courses in courses_par_jour.items():
-        preds_jour = []
-        for course in jour_courses:
-            pred_stmt = select(Prediction).where(
-                Prediction.course_id == course.id,
-                Prediction.rang_predit == 1,
-                Prediction.resultat_gagnant.is_not(None),
-            )
-            pred = (await db.execute(pred_stmt)).scalar_one_or_none()
-            if not pred:
-                continue
+    for pred in preds:
+        partant = (await db.execute(
+            select(Partant).where(Partant.id == pred.partant_id)
+        )).scalar_one_or_none()
 
-            partant = (await db.execute(
-                select(Partant).where(Partant.id == pred.partant_id)
-            )).scalar_one_or_none()
-
-            preds_jour.append((pred, partant))
-
-        # Trier par confiance décroissante, garder top 5
-        preds_jour.sort(key=lambda x: x[0].score_confiance, reverse=True)
-        for pred, partant in preds_jour[:5]:
-            total += 1
-            if pred.resultat_gagnant:
-                gagnant_ok += 1
-                profit_g += (partant.rapport_gagnant or 0) - 1.0 if partant else -1.0
-            else:
-                profit_g -= 1.0
-            if pred.resultat_place:
-                place_ok += 1
-                profit_p += ((partant.rapport_place or 0) * 4) - 4.0 if partant else -4.0
-            else:
-                profit_p -= 4.0
+        if pred.resultat_gagnant:
+            gagnant_ok += 1
+            profit_g += (partant.rapport_gagnant or 0) - 1.0 if partant else -1.0
+        else:
+            profit_g -= 1.0
+        if pred.resultat_place:
+            place_ok += 1
+            profit_p += ((partant.rapport_place or 0) * 4) - 4.0 if partant else -4.0
+        else:
+            profit_p -= 4.0
 
     perdu = total - place_ok
 

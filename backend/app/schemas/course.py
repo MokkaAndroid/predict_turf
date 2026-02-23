@@ -48,6 +48,7 @@ class CourseListSchema(BaseModel):
     # Résumé prédiction
     favori_nom: str | None = None
     favori_confiance: float | None = None
+    top5_confiance: bool = False
     # Backtesting
     prediction_correcte_gagnant: bool | None = None
     prediction_correcte_place: bool | None = None
@@ -97,6 +98,7 @@ class PrevisionJourSchema(BaseModel):
     probabilite: float
     score_confiance: float
     is_value_bet: bool
+    top5_confiance: bool = False
     commentaire: str | None = None
 
     class Config:

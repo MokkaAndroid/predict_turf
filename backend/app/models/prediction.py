@@ -16,6 +16,7 @@ class Prediction(Base):
     rang_predit: Mapped[int] = mapped_column(Integer)  # 1=favori modèle
     score_confiance: Mapped[float] = mapped_column(Float)  # 0–100, confiance du pari
     is_value_bet: Mapped[bool] = mapped_column(default=False)
+    top5_confiance: Mapped[bool] = mapped_column(default=False)  # True si dans le top 5 confiance du jour
     commentaire: Mapped[str | None] = mapped_column(Text)  # justification textuelle
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
