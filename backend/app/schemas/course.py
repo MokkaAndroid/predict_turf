@@ -103,6 +103,53 @@ class PrevisionJourSchema(BaseModel):
         from_attributes = True
 
 
+class BilanVeilleSchema(BaseModel):
+    """Bilan d'une prédiction de la veille (top 5 confiance)."""
+    course_id: int
+    hippodrome: str
+    numero_reunion: int
+    numero_course: int
+    heure: str
+    cheval_nom: str
+    numero: int
+    cote: float | None = None
+    score_confiance: float
+    resultat: str  # "gagnant", "place", "perdu"
+    classement: int | None = None
+    gain_gagnant: float  # avec mise 1€
+    gain_place: float  # avec mise 4€
+
+    class Config:
+        from_attributes = True
+
+
+class BilanVeilleSummarySchema(BaseModel):
+    date_veille: str
+    bilans: list[BilanVeilleSchema] = []
+    total_mise: float  # 5 courses × (1€ gagnant + 4€ placé) = 25€
+    total_gain: float
+    profit: float
+
+    class Config:
+        from_attributes = True
+
+
+class ConfianceStatsSchema(BaseModel):
+    """Stats historiques des top-5 confiance."""
+    total_courses: int
+    gagnant_correct: int
+    place_correct: int
+    perdu: int
+    taux_gagnant: float
+    taux_place: float
+    profit_gagnant_1e: float
+    profit_place_4e: float
+    profit_total: float
+
+    class Config:
+        from_attributes = True
+
+
 class BacktestingStatsSchema(BaseModel):
     total_courses: int
     courses_predites: int

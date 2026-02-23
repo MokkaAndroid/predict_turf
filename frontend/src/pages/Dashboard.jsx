@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart } from 'recharts'
-import { getBacktestingStats, getCoursesPassees, getCoursesAVenir, getPrevisionsJour } from '../api'
-import { TrendingUp, TrendingDown, BarChart3, Target, Trophy, ArrowRight, Clock, ChevronRight, Zap, CalendarDays } from 'lucide-react'
+import { getBacktestingStats, getCoursesPassees, getCoursesAVenir, getPrevisionsJour, getBilanVeille, getConfianceStats } from '../api'
+import { TrendingUp, TrendingDown, BarChart3, Target, Trophy, ArrowRight, Clock, ChevronRight, Zap, CalendarDays, History, ShieldCheck } from 'lucide-react'
 
 function StatCard({ label, value, sub, icon: Icon, positive }) {
   return (
@@ -42,6 +42,8 @@ export default function Dashboard() {
   const [passees, setPassees] = useState([])
   const [aVenir, setAVenir] = useState([])
   const [top5, setTop5] = useState([])
+  const [bilanVeille, setBilanVeille] = useState(null)
+  const [confianceStats, setConfianceStats] = useState(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
@@ -50,11 +52,15 @@ export default function Dashboard() {
       getCoursesPassees(20).catch(() => []),
       getCoursesAVenir(10).catch(() => []),
       getPrevisionsJour().catch(() => []),
-    ]).then(([s, p, a, t]) => {
+      getBilanVeille().catch(() => null),
+      getConfianceStats().catch(() => null),
+    ]).then(([s, p, a, t, bv, cs]) => {
       setStats(s)
       setPassees(p)
       setAVenir(a)
       setTop5(t.slice(0, 5))
+      setBilanVeille(bv)
+      setConfianceStats(cs)
       setLoading(false)
     })
   }, [])
@@ -212,6 +218,158 @@ export default function Dashboard() {
               <Area type="monotone" dataKey="place" stroke="#d4af37" fill="url(#gradPlace)" name="Place" strokeWidth={2} />
             </AreaChart>
           </ResponsiveContainer>
+        </div>
+      )}
+
+      {/* ── Bilan de la veille (Top 5 confiance) ── */}
+      {bilanVeille && bilanVeille.bilans?.length > 0 && (
+        <div className="card p-6">
+          <div className="flex items-center justify-between mb-5">
+            <div className="flex items-center gap-3">
+              <div className="w-8 h-8 rounded-lg bg-purple-100 flex items-center justify-center">
+                <History className="w-4 h-4 text-purple-600" />
+              </div>
+              <div>
+                <h2 className="font-display font-semibold text-stone-800 text-lg">Bilan de la veille</h2>
+                <p className="text-xs text-stone-400">Top 5 confiances du {bilanVeille.date_veille} — Mise : 1€ gagnant + 4€ place par course</p>
+              </div>
+            </div>
+            <div className={`text-right px-4 py-2 rounded-xl ${bilanVeille.profit >= 0 ? 'bg-green-50' : 'bg-red-50'}`}>
+              <p className="text-[10px] uppercase tracking-wider text-stone-400">P&L</p>
+              <p className={`text-xl font-mono font-bold ${bilanVeille.profit >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                {bilanVeille.profit >= 0 ? '+' : ''}{bilanVeille.profit.toFixed(2)} €
+              </p>
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full table-premium">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Course</th>
+                  <th>Heure</th>
+                  <th>Cheval</th>
+                  <th className="text-right">Cote</th>
+                  <th className="text-right">Confiance</th>
+                  <th className="text-center">Resultat</th>
+                  <th className="text-right">Gain 1€ G</th>
+                  <th className="text-right">Gain 4€ P</th>
+                  <th className="text-right">Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                {bilanVeille.bilans.map((b, i) => (
+                  <tr key={b.course_id} className={b.resultat === 'gagnant' ? '!bg-green-50/60' : b.resultat === 'place' ? '!bg-gold-50/60' : ''}>
+                    <td className="font-display font-bold text-stone-600">{i + 1}</td>
+                    <td>
+                      <Link to={`/course/${b.course_id}`} className="text-racing-600 hover:text-racing-700 font-medium">
+                        R{b.numero_reunion}C{b.numero_course}
+                      </Link>
+                      <span className="text-xs text-stone-400 ml-1">{b.hippodrome}</span>
+                    </td>
+                    <td className="text-stone-400 font-mono text-xs">{b.heure}</td>
+                    <td>
+                      <span className="font-semibold text-stone-800">{b.cheval_nom}</span>
+                      <span className="text-xs text-stone-400 ml-1">N{b.numero}</span>
+                    </td>
+                    <td className="text-right font-mono font-bold text-stone-600">{b.cote?.toFixed(1) || '-'}</td>
+                    <td className="text-right">
+                      <span className={`font-mono font-bold text-sm ${b.score_confiance >= 50 ? 'text-racing-600' : b.score_confiance >= 30 ? 'text-gold-600' : 'text-stone-400'}`}>
+                        {b.score_confiance.toFixed(0)}%
+                      </span>
+                    </td>
+                    <td className="text-center">
+                      <span className={`text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-lg ${
+                        b.resultat === 'gagnant' ? 'bg-green-100 text-green-700'
+                          : b.resultat === 'place' ? 'bg-gold-100 text-gold-700'
+                          : 'bg-stone-100 text-stone-500'
+                      }`}>
+                        {b.resultat === 'gagnant' ? '1er' : b.resultat === 'place' ? `${b.classement || ''}e` : 'Perdu'}
+                      </span>
+                    </td>
+                    <td className={`text-right font-mono font-bold text-sm ${b.gain_gagnant >= 0 ? 'text-green-600' : 'text-red-500'}`}>
+                      {b.gain_gagnant >= 0 ? '+' : ''}{b.gain_gagnant.toFixed(2)}
+                    </td>
+                    <td className={`text-right font-mono font-bold text-sm ${b.gain_place >= 0 ? 'text-green-600' : 'text-red-500'}`}>
+                      {b.gain_place >= 0 ? '+' : ''}{b.gain_place.toFixed(2)}
+                    </td>
+                    <td className={`text-right font-mono font-bold text-sm ${(b.gain_gagnant + b.gain_place) >= 0 ? 'text-green-600' : 'text-red-500'}`}>
+                      {(b.gain_gagnant + b.gain_place) >= 0 ? '+' : ''}{(b.gain_gagnant + b.gain_place).toFixed(2)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr className="border-t-2 border-stone-200">
+                  <td colSpan={7} className="font-display font-semibold text-stone-700 text-right">Total (mise {bilanVeille.total_mise.toFixed(0)}€)</td>
+                  <td className={`text-right font-mono font-bold ${bilanVeille.bilans.reduce((s, b) => s + b.gain_gagnant, 0) >= 0 ? 'text-green-600' : 'text-red-500'}`}>
+                    {bilanVeille.bilans.reduce((s, b) => s + b.gain_gagnant, 0) >= 0 ? '+' : ''}{bilanVeille.bilans.reduce((s, b) => s + b.gain_gagnant, 0).toFixed(2)}
+                  </td>
+                  <td className={`text-right font-mono font-bold ${bilanVeille.bilans.reduce((s, b) => s + b.gain_place, 0) >= 0 ? 'text-green-600' : 'text-red-500'}`}>
+                    {bilanVeille.bilans.reduce((s, b) => s + b.gain_place, 0) >= 0 ? '+' : ''}{bilanVeille.bilans.reduce((s, b) => s + b.gain_place, 0).toFixed(2)}
+                  </td>
+                  <td className={`text-right font-mono font-bold text-base ${bilanVeille.profit >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                    {bilanVeille.profit >= 0 ? '+' : ''}{bilanVeille.profit.toFixed(2)} €
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* ── Fiabilité historique des confiances (Top 5) ── */}
+      {confianceStats && confianceStats.total_courses > 0 && (
+        <div className="card p-6">
+          <div className="flex items-center gap-3 mb-5">
+            <div className="w-8 h-8 rounded-lg bg-blue-100 flex items-center justify-center">
+              <ShieldCheck className="w-4 h-4 text-blue-600" />
+            </div>
+            <div>
+              <h2 className="font-display font-semibold text-stone-800 text-lg">Fiabilite des Top 5 confiances</h2>
+              <p className="text-xs text-stone-400">Statistiques sur {confianceStats.total_courses} courses (top 5 confiance par jour, tout l'historique)</p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+            <div className="bg-stone-50 rounded-xl p-4 text-center">
+              <p className="text-[10px] uppercase tracking-wider text-stone-400 mb-1">Courses analysees</p>
+              <p className="text-2xl font-mono font-bold text-stone-800">{confianceStats.total_courses}</p>
+            </div>
+            <div className="bg-green-50 rounded-xl p-4 text-center">
+              <p className="text-[10px] uppercase tracking-wider text-green-600 mb-1">Taux gagnant</p>
+              <p className="text-2xl font-mono font-bold text-green-700">{confianceStats.taux_gagnant}%</p>
+              <p className="text-xs text-green-600 mt-1">{confianceStats.gagnant_correct} / {confianceStats.total_courses}</p>
+            </div>
+            <div className="bg-gold-50 rounded-xl p-4 text-center">
+              <p className="text-[10px] uppercase tracking-wider text-gold-600 mb-1">Taux place</p>
+              <p className="text-2xl font-mono font-bold text-gold-700">{confianceStats.taux_place}%</p>
+              <p className="text-xs text-gold-600 mt-1">{confianceStats.place_correct} / {confianceStats.total_courses}</p>
+            </div>
+            <div className={`rounded-xl p-4 text-center ${confianceStats.profit_gagnant_1e >= 0 ? 'bg-green-50' : 'bg-red-50'}`}>
+              <p className="text-[10px] uppercase tracking-wider text-stone-400 mb-1">P&L Gagnant (1€)</p>
+              <p className={`text-2xl font-mono font-bold ${confianceStats.profit_gagnant_1e >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+                {confianceStats.profit_gagnant_1e >= 0 ? '+' : ''}{confianceStats.profit_gagnant_1e.toFixed(2)}€
+              </p>
+            </div>
+            <div className={`rounded-xl p-4 text-center ${confianceStats.profit_place_4e >= 0 ? 'bg-green-50' : 'bg-red-50'}`}>
+              <p className="text-[10px] uppercase tracking-wider text-stone-400 mb-1">P&L Place (4€)</p>
+              <p className={`text-2xl font-mono font-bold ${confianceStats.profit_place_4e >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+                {confianceStats.profit_place_4e >= 0 ? '+' : ''}{confianceStats.profit_place_4e.toFixed(2)}€
+              </p>
+            </div>
+          </div>
+
+          <div className={`mt-4 rounded-xl p-4 text-center ${confianceStats.profit_total >= 0 ? 'bg-green-100 border border-green-200' : 'bg-red-100 border border-red-200'}`}>
+            <p className="text-xs uppercase tracking-wider text-stone-500 mb-1">Profit/Perte total (1€ G + 4€ P par course)</p>
+            <p className={`text-3xl font-mono font-bold ${confianceStats.profit_total >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+              {confianceStats.profit_total >= 0 ? '+' : ''}{confianceStats.profit_total.toFixed(2)} €
+            </p>
+            <p className="text-xs text-stone-400 mt-1">
+              Sur {confianceStats.total_courses} courses a 5€ = {(confianceStats.total_courses * 5).toFixed(0)}€ mises |
+              ROI : {((confianceStats.profit_total / (confianceStats.total_courses * 5)) * 100).toFixed(1)}%
+            </p>
+          </div>
         </div>
       )}
 

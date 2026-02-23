@@ -56,6 +56,14 @@ export async function postReset() {
   return fetchJSON('/reset', { method: 'POST' })
 }
 
+export async function getBilanVeille() {
+  return fetchJSON('/bilan-veille')
+}
+
+export async function getConfianceStats() {
+  return fetchJSON('/confiance/stats')
+}
+
 export async function postDailyUpdate() {
   return fetchJSON('/daily-update', { method: 'POST' })
 }

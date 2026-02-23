@@ -13,6 +13,9 @@ from app.schemas.course import (
     PredictionSchema,
     PrevisionJourSchema,
     BacktestingStatsSchema,
+    BilanVeilleSchema,
+    BilanVeilleSummarySchema,
+    ConfianceStatsSchema,
 )
 
 router = APIRouter(prefix="/api", tags=["courses"])
@@ -372,4 +375,164 @@ async def backtesting_stats(
         profit_gagnant=round(profit_gagnant, 2),
         profit_place=round(profit_place, 2),
         mise_unitaire=mise,
+    )
+
+
+@router.get("/bilan-veille", response_model=BilanVeilleSummarySchema)
+async def bilan_veille(db: AsyncSession = Depends(get_db)):
+    """Bilan des 5 meilleures confiances de la veille : résultat et gains simulés
+    avec 1€ sur le gagnant et 4€ sur le placé par course."""
+    yesterday = date.today() - timedelta(days=1)
+    yesterday_start = datetime.combine(yesterday, datetime.min.time())
+    today_start = datetime.combine(date.today(), datetime.min.time())
+
+    # Courses de la veille terminées
+    stmt = (
+        select(Course)
+        .where(
+            Course.date >= yesterday_start,
+            Course.date < today_start,
+            Course.statut == "TERMINE",
+        )
+    )
+    result = await db.execute(stmt)
+    courses = result.scalars().all()
+
+    # Récupérer les prédictions rang 1 pour ces courses, triées par confiance
+    items = []
+    for course in courses:
+        pred_stmt = (
+            select(Prediction)
+            .where(Prediction.course_id == course.id, Prediction.rang_predit == 1)
+        )
+        pred = (await db.execute(pred_stmt)).scalar_one_or_none()
+        if not pred:
+            continue
+
+        partant = (await db.execute(
+            select(Partant).where(Partant.id == pred.partant_id)
+        )).scalar_one_or_none()
+        if not partant:
+            continue
+
+        cheval = (await db.execute(
+            select(Cheval).where(Cheval.id == partant.cheval_id)
+        )).scalar_one_or_none()
+
+        # Déterminer le résultat
+        if pred.resultat_gagnant:
+            resultat = "gagnant"
+        elif pred.resultat_place:
+            resultat = "place"
+        else:
+            resultat = "perdu"
+
+        # Gains simulés : 1€ gagnant, 4€ placé
+        gain_g = (partant.rapport_gagnant or 0) - 1.0 if pred.resultat_gagnant else -1.0
+        gain_p = ((partant.rapport_place or 0) * 4) - 4.0 if pred.resultat_place else -4.0
+
+        items.append(BilanVeilleSchema(
+            course_id=course.id,
+            hippodrome=course.hippodrome,
+            numero_reunion=course.numero_reunion,
+            numero_course=course.numero_course,
+            heure=course.date.strftime("%H:%M"),
+            cheval_nom=cheval.nom if cheval else "?",
+            numero=partant.numero,
+            cote=partant.cote_depart or partant.cote_probable,
+            score_confiance=pred.score_confiance,
+            resultat=resultat,
+            classement=partant.classement,
+            gain_gagnant=round(gain_g, 2),
+            gain_place=round(gain_p, 2),
+        ))
+
+    # Trier par confiance décroissante, prendre les 5 meilleurs
+    items.sort(key=lambda x: x.score_confiance, reverse=True)
+    top5 = items[:5]
+
+    total_gain = sum(b.gain_gagnant + b.gain_place for b in top5)
+    total_mise = len(top5) * 5.0  # 1€ gagnant + 4€ placé par course
+
+    return BilanVeilleSummarySchema(
+        date_veille=yesterday.strftime("%d/%m/%Y"),
+        bilans=top5,
+        total_mise=total_mise,
+        total_gain=round(total_mise + total_gain, 2),
+        profit=round(total_gain, 2),
+    )
+
+
+@router.get("/confiance/stats", response_model=ConfianceStatsSchema)
+async def confiance_stats(db: AsyncSession = Depends(get_db)):
+    """Stats historiques des top-5 confiance par jour :
+    taux gagnant/placé sur toute la profondeur d'historique."""
+    # Toutes les courses terminées avec prédictions backtestées
+    stmt = (
+        select(Course)
+        .where(Course.statut == "TERMINE")
+        .order_by(Course.date)
+    )
+    result = await db.execute(stmt)
+    courses = result.scalars().all()
+
+    # Grouper les courses par jour
+    from collections import defaultdict
+    courses_par_jour = defaultdict(list)
+    for c in courses:
+        jour = c.date.date()
+        courses_par_jour[jour].append(c)
+
+    # Pour chaque jour, prendre les 5 meilleures confiances
+    total = 0
+    gagnant_ok = 0
+    place_ok = 0
+    profit_g = 0.0
+    profit_p = 0.0
+
+    for jour, jour_courses in courses_par_jour.items():
+        preds_jour = []
+        for course in jour_courses:
+            pred_stmt = select(Prediction).where(
+                Prediction.course_id == course.id,
+                Prediction.rang_predit == 1,
+                Prediction.resultat_gagnant.is_not(None),
+            )
+            pred = (await db.execute(pred_stmt)).scalar_one_or_none()
+            if not pred:
+                continue
+
+            partant = (await db.execute(
+                select(Partant).where(Partant.id == pred.partant_id)
+            )).scalar_one_or_none()
+
+            preds_jour.append((pred, partant))
+
+        # Trier par confiance décroissante, garder top 5
+        preds_jour.sort(key=lambda x: x[0].score_confiance, reverse=True)
+        for pred, partant in preds_jour[:5]:
+            total += 1
+            if pred.resultat_gagnant:
+                gagnant_ok += 1
+                profit_g += (partant.rapport_gagnant or 0) - 1.0 if partant else -1.0
+            else:
+                profit_g -= 1.0
+            if pred.resultat_place:
+                place_ok += 1
+                profit_p += ((partant.rapport_place or 0) * 4) - 4.0 if partant else -4.0
+            else:
+                profit_p -= 4.0
+
+    perdu = total - place_ok
+
+    return ConfianceStatsSchema(
+        total_courses=total,
+        gagnant_correct=gagnant_ok,
+        place_correct=place_ok,
+        perdu=perdu,
+        taux_gagnant=round(gagnant_ok / max(total, 1) * 100, 1),
+        taux_place=round(place_ok / max(total, 1) * 100, 1),
+        profit_gagnant_1e=round(profit_g, 2),
+        profit_place_4e=round(profit_p, 2),
+        profit_total=round(profit_g + profit_p, 2),
     )
