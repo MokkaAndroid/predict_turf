@@ -90,6 +90,67 @@ async def collect_today():
         await collector.close()
 
 
+@app.post("/api/daily-update")
+async def daily_update(db: AsyncSession = Depends(get_db)):
+    """Mise à jour quotidienne : collecte/rafraîchit les courses du jour,
+    supprime les anciennes prédictions du jour, puis re-génère les prédictions."""
+    today = date.today()
+    collector = PMUCollector()
+    try:
+        # 1. Collecter les nouvelles courses + mettre à jour les existantes
+        update_result = await collector.update_today(today, only_plat=True)
+    except Exception as e:
+        logger.error("Erreur daily-update collecte: %s", e)
+        return {"status": "error", "step": "collect", "error": str(e)}
+    finally:
+        await collector.close()
+
+    # 2. Supprimer les prédictions existantes du jour pour les re-générer
+    from datetime import datetime as dt, timedelta as td
+    today_start = dt.combine(today, dt.min.time())
+    tomorrow_start = dt.combine(today + td(days=1), dt.min.time())
+
+    stmt = select(Course).where(
+        Course.date >= today_start,
+        Course.date < tomorrow_start,
+        Course.statut == "A_VENIR",
+    )
+    result = await db.execute(stmt)
+    courses_today = result.scalars().all()
+
+    deleted_preds = 0
+    for course in courses_today:
+        del_stmt = select(Prediction).where(Prediction.course_id == course.id)
+        existing_preds = await db.execute(del_stmt)
+        for pred in existing_preds.scalars().all():
+            await db.delete(pred)
+            deleted_preds += 1
+    await db.commit()
+
+    # 3. Re-générer les prédictions
+    predicted = 0
+    errors = 0
+    if predictor.model is not None:
+        for course in courses_today:
+            try:
+                await predictor.predict_and_save(db, course)
+                predicted += 1
+            except Exception as e:
+                logger.error("Erreur prediction course %s: %s", course.id, e)
+                errors += 1
+        await db.commit()
+
+    return {
+        "status": "ok",
+        "courses_mises_a_jour": update_result.get("updated", 0),
+        "courses_creees": update_result.get("created", 0),
+        "predictions_supprimees": deleted_preds,
+        "predictions_generees": predicted,
+        "erreurs_prediction": errors,
+        "model_loaded": predictor.model is not None,
+    }
+
+
 @app.post("/api/train")
 async def train_model(db: AsyncSession = Depends(get_db)):
     """Entraîne le modèle ML sur les données historiques."""

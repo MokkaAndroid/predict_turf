@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react'
 import { Link } from 'react-router-dom'
-import { getPrevisionsJour } from '../api'
-import { Target, Filter, Zap, Users, MapPin, ChevronRight } from 'lucide-react'
+import { getPrevisionsJour, postDailyUpdate } from '../api'
+import { Target, Filter, Zap, Users, MapPin, ChevronRight, RefreshCw } from 'lucide-react'
 
 function ConfidenceGauge({ value }) {
   const pct = Math.min(value, 100)
@@ -58,13 +58,33 @@ export default function PrevisionsJour() {
   const [loading, setLoading] = useState(true)
   const [filterReunion, setFilterReunion] = useState('all')
   const [filterCourse, setFilterCourse] = useState('all')
+  const [updating, setUpdating] = useState(false)
+  const [updateResult, setUpdateResult] = useState(null)
 
-  useEffect(() => {
+  const loadPrevisions = () => {
+    setLoading(true)
     getPrevisionsJour()
       .then(setPrevisions)
       .catch(() => setPrevisions([]))
       .finally(() => setLoading(false))
-  }, [])
+  }
+
+  useEffect(() => { loadPrevisions() }, [])
+
+  const handleDailyUpdate = async () => {
+    setUpdating(true)
+    setUpdateResult(null)
+    try {
+      const result = await postDailyUpdate()
+      setUpdateResult(result)
+      // Recharger les prévisions avec les données à jour
+      loadPrevisions()
+    } catch (e) {
+      setUpdateResult({ status: 'error', error: e.message })
+    } finally {
+      setUpdating(false)
+    }
+  }
 
   const reunions = useMemo(() => {
     const map = new Map()
@@ -117,15 +137,46 @@ export default function PrevisionsJour() {
 
   return (
     <div className="space-y-6 animate-slide-up">
-      <div className="flex items-center gap-3">
-        <div className="w-10 h-10 rounded-xl bg-gold-100 flex items-center justify-center">
-          <Target className="w-5 h-5 text-gold-600" />
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-xl bg-gold-100 flex items-center justify-center">
+            <Target className="w-5 h-5 text-gold-600" />
+          </div>
+          <div>
+            <h1 className="text-3xl font-display font-bold text-stone-900">Previsions du jour</h1>
+            <p className="text-stone-400 mt-0.5 capitalize text-sm">{dateStr}</p>
+          </div>
         </div>
-        <div>
-          <h1 className="text-3xl font-display font-bold text-stone-900">Previsions du jour</h1>
-          <p className="text-stone-400 mt-0.5 capitalize text-sm">{dateStr}</p>
-        </div>
+        <button
+          onClick={handleDailyUpdate}
+          disabled={updating}
+          className={`flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm transition-all shadow-sm ${
+            updating
+              ? 'bg-stone-100 text-stone-400 cursor-wait'
+              : 'bg-racing-700 text-white hover:bg-racing-800 hover:shadow-md active:scale-95'
+          }`}
+        >
+          <RefreshCw className={`w-4 h-4 ${updating ? 'animate-spin' : ''}`} />
+          {updating ? 'Mise a jour...' : 'Mise a jour quotidienne'}
+        </button>
       </div>
+
+      {/* Feedback mise à jour */}
+      {updateResult && (
+        <div className={`card p-4 text-sm ${updateResult.status === 'ok' ? 'border-green-200 bg-green-50' : 'border-red-200 bg-red-50'}`}>
+          {updateResult.status === 'ok' ? (
+            <div className="flex items-center gap-4 text-green-700">
+              <span className="font-semibold">Mise a jour terminee</span>
+              <span>{updateResult.courses_mises_a_jour} course(s) rafraichie(s)</span>
+              <span>{updateResult.courses_creees} nouvelle(s)</span>
+              <span>{updateResult.predictions_generees} prediction(s) generee(s)</span>
+              {!updateResult.model_loaded && <span className="text-gold-600 font-medium">Modele non charge — entrainez-le depuis l'admin</span>}
+            </div>
+          ) : (
+            <span className="text-red-600">Erreur : {updateResult.error}</span>
+          )}
+        </div>
+      )}
 
       {previsions.length === 0 ? (
         <div className="card p-8 text-center border-gold-200 bg-gold-50/50">

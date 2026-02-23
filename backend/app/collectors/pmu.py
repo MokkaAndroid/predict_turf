@@ -248,6 +248,183 @@ class PMUCollector:
             await session.commit()
         return count
 
+    async def update_today(self, d: date, only_plat: bool = True) -> dict:
+        """Met à jour les données des courses existantes (côtes, conditions, statut)
+        ET collecte les nouvelles courses. Retourne un résumé des actions."""
+        programme = await self.get_programme(d)
+        if not programme:
+            logger.info("Aucun programme pour %s", d)
+            return {"updated": 0, "created": 0}
+
+        updated = 0
+        created = 0
+        reunions = programme.get("reunions", [])
+
+        async with async_session() as session:
+            for reunion in reunions:
+                num_reunion = reunion.get("numOfficiel", 0)
+                hippodrome_data = reunion.get("hippodrome", {})
+                hippodrome = hippodrome_data.get("libelleCourt", "INCONNU")
+                pays = reunion.get("pays", {}).get("code", "")
+
+                if pays != "FRA":
+                    continue
+
+                # Extraire les infos météo / piste au niveau de la réunion
+                meteo = reunion.get("meteo", {})
+                condition_piste_plat = None
+                piste_info = reunion.get("ppisteInfos", [])
+                if not piste_info:
+                    piste_info = reunion.get("pistesInfos", [])
+                for pi in (piste_info or []):
+                    if pi.get("typePiste") == "PLAT":
+                        condition_piste_plat = pi.get("libelle") or pi.get("etat")
+
+                courses = reunion.get("courses", [])
+                for course_data in courses:
+                    discipline = course_data.get("discipline", "")
+                    if only_plat and discipline != "PLAT":
+                        continue
+
+                    num_course = course_data.get("numOrdre", 0)
+                    pmu_id = f"{_date_fmt(d)}_R{num_reunion}_C{num_course}"
+
+                    stmt = select(Course).where(Course.pmu_id == pmu_id)
+                    result = await session.execute(stmt)
+                    existing = result.scalar_one_or_none()
+
+                    if existing:
+                        # ── Mise à jour de la course existante ──
+                        existing.nombre_partants = course_data.get("nombreDeclaresPartants") or existing.nombre_partants
+                        existing.dotation = course_data.get("montantTotalOffert") or existing.dotation
+                        if condition_piste_plat:
+                            existing.condition_piste = condition_piste_plat
+                        surface = course_data.get("typePiste")
+                        if surface:
+                            existing.surface = surface
+
+                        # ── Mise à jour des côtes des partants ──
+                        participants = await self.get_participants(d, num_reunion, num_course)
+                        for p in participants:
+                            numero = p.get("numPmu", 0)
+                            stmt_p = select(Partant).where(
+                                Partant.course_id == existing.id,
+                                Partant.numero == numero,
+                            )
+                            p_result = await session.execute(stmt_p)
+                            partant = p_result.scalar_one_or_none()
+                            if partant:
+                                # Mettre à jour les côtes
+                                if p.get("dernierRapportReference"):
+                                    new_cote = p["dernierRapportReference"].get("rapport")
+                                    if new_cote:
+                                        partant.cote_probable = new_cote
+                                if p.get("dernierRapportDirect"):
+                                    new_cote = p["dernierRapportDirect"].get("rapport")
+                                    if new_cote:
+                                        partant.cote_depart = new_cote
+                                # Mettre à jour poids si changé
+                                poids = p.get("handicapPoids")
+                                if poids:
+                                    partant.poids = poids / 10
+                                # Statut (NON_PARTANT tardif)
+                                if p.get("statut") == "NON_PARTANT":
+                                    partant.statut = "NON_PARTANT"
+
+                        # Vérifier si la course est terminée
+                        rapports = await self.get_rapports(d, num_reunion, num_course)
+                        if rapports and not isinstance(rapports, dict):
+                            parsed = self.parse_rapports(rapports)
+                            if parsed["gagnant"] and existing.statut != "TERMINE":
+                                existing.statut = "TERMINE"
+                                stmt_pts = select(Partant).where(Partant.course_id == existing.id)
+                                pts_result = await session.execute(stmt_pts)
+                                partants_db = pts_result.scalars().all()
+                                for pt in partants_db:
+                                    if pt.numero == parsed["gagnant"]:
+                                        pt.classement = 1
+                                        pt.rapport_gagnant = parsed["rapports_gagnant"].get(pt.numero, 0)
+                                        pt.rapport_place = parsed["rapports_place"].get(pt.numero, 0)
+                                    elif pt.numero in parsed["places"]:
+                                        pt.classement = 2
+                                        pt.rapport_place = parsed["rapports_place"].get(pt.numero, 0)
+
+                        updated += 1
+                        await asyncio.sleep(0.3)
+                    else:
+                        # ── Nouvelle course : création complète ──
+                        heure_ts = course_data.get("heureDepart", 0)
+                        heure_depart = datetime.fromtimestamp(heure_ts / 1000) if heure_ts else datetime.combine(d, datetime.min.time())
+
+                        course = Course(
+                            pmu_id=pmu_id,
+                            date=heure_depart,
+                            hippodrome=hippodrome,
+                            numero_reunion=num_reunion,
+                            numero_course=num_course,
+                            discipline=discipline,
+                            surface=course_data.get("typePiste"),
+                            distance=course_data.get("distance"),
+                            condition_piste=condition_piste_plat,
+                            nombre_partants=course_data.get("nombreDeclaresPartants"),
+                            dotation=course_data.get("montantTotalOffert"),
+                            categorie=course_data.get("categorieParticularite"),
+                            statut="A_VENIR",
+                        )
+                        session.add(course)
+                        await session.flush()
+
+                        participants = await self.get_participants(d, num_reunion, num_course)
+                        for p in participants:
+                            if p.get("statut") == "NON_PARTANT":
+                                continue
+                            cheval = await self._get_or_create_cheval(session, p)
+                            jockey = await self._get_or_create_jockey(session, p.get("driver", "INCONNU"))
+                            entraineur = await self._get_or_create_entraineur(session, p.get("entraineur", "INCONNU"))
+
+                            cote_ref = None
+                            if p.get("dernierRapportReference"):
+                                cote_ref = p["dernierRapportReference"].get("rapport")
+                            cote_direct = None
+                            if p.get("dernierRapportDirect"):
+                                cote_direct = p["dernierRapportDirect"].get("rapport")
+
+                            partant = Partant(
+                                course_id=course.id,
+                                cheval_id=cheval.id,
+                                jockey_id=jockey.id,
+                                entraineur_id=entraineur.id,
+                                numero=p.get("numPmu", 0),
+                                poids=(p.get("handicapPoids") or 0) / 10,
+                                cote_probable=cote_ref,
+                                cote_depart=cote_direct,
+                            )
+                            session.add(partant)
+
+                        rapports = await self.get_rapports(d, num_reunion, num_course)
+                        if rapports and not isinstance(rapports, dict):
+                            parsed = self.parse_rapports(rapports)
+                            if parsed["gagnant"]:
+                                course.statut = "TERMINE"
+                                await session.flush()
+                                stmt_pts = select(Partant).where(Partant.course_id == course.id)
+                                pts_result = await session.execute(stmt_pts)
+                                partants_db = pts_result.scalars().all()
+                                for pt in partants_db:
+                                    if pt.numero == parsed["gagnant"]:
+                                        pt.classement = 1
+                                        pt.rapport_gagnant = parsed["rapports_gagnant"].get(pt.numero, 0)
+                                        pt.rapport_place = parsed["rapports_place"].get(pt.numero, 0)
+                                    elif pt.numero in parsed["places"]:
+                                        pt.classement = 2
+                                        pt.rapport_place = parsed["rapports_place"].get(pt.numero, 0)
+
+                        created += 1
+                        await asyncio.sleep(0.3)
+
+            await session.commit()
+        return {"updated": updated, "created": created}
+
     async def collect_range(self, start: date, end: date, only_plat: bool = True) -> int:
         """Collecte les courses sur une plage de dates, jour par jour avec gestion d'erreur."""
         total = 0

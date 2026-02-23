@@ -55,3 +55,7 @@ export async function postBacktest() {
 export async function postReset() {
   return fetchJSON('/reset', { method: 'POST' })
 }
+
+export async function postDailyUpdate() {
+  return fetchJSON('/daily-update', { method: 'POST' })
+}
