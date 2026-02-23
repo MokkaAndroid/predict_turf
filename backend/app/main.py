@@ -269,29 +269,6 @@ async def backtest_all(db: AsyncSession = Depends(get_db)):
     return {"status": "ok", "courses_backtestees": count}
 
 
-@app.post("/api/mark-top5-history")
-async def mark_top5_history(db: AsyncSession = Depends(get_db)):
-    """Marque les top 5 confiance pour toutes les dates historiques (migration one-shot)."""
-    from collections import defaultdict as _dd
-    stmt = select(Course).order_by(Course.date)
-    result = await db.execute(stmt)
-    courses = result.scalars().all()
-
-    jours = set()
-    for c in courses:
-        jours.add(c.date.date())
-
-    count = 0
-    for jour in sorted(jours):
-        await mark_top5_confiance(db, jour)
-        count += 1
-        if count % 30 == 0:
-            await db.commit()
-
-    await db.commit()
-    return {"status": "ok", "jours_traites": count}
-
-
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "model_loaded": predictor.model is not None}
