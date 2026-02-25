@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 # ── État global pour les tâches longues en arrière-plan ────────
 _train_status: dict = {"state": "idle"}
+_predict_status: dict = {"state": "idle"}
 
 
 async def mark_top5_confiance(db: AsyncSession, target_date: date):
@@ -241,42 +242,63 @@ async def tune_model(
 
 
 @app.post("/api/predict")
-async def predict_all(db: AsyncSession = Depends(get_db)):
-    """Génère les prédictions pour toutes les courses non encore prédites (A_VENIR + TERMINE)."""
-    stmt = select(Course).where(Course.statut.in_(["A_VENIR", "TERMINE"]))
-    result = await db.execute(stmt)
-    courses = result.scalars().all()
+async def predict_all():
+    """Lance la génération des prédictions en arrière-plan."""
+    global _predict_status
+    if _predict_status.get("state") == "running":
+        return {"status": "already_running"}
 
-    count = 0
-    errors = 0
-    for course in courses:
-        pred_check = select(Prediction).where(Prediction.course_id == course.id)
-        existing = await db.execute(pred_check)
-        if existing.scalars().first():
-            continue
+    _predict_status = {"state": "running"}
 
+    async def _do_predict():
+        global _predict_status
         try:
-            await predictor.predict_and_save(db, course)
-            count += 1
+            async with async_session() as db:
+                stmt = select(Course).where(Course.statut.in_(["A_VENIR", "TERMINE"]))
+                result = await db.execute(stmt)
+                courses = result.scalars().all()
+
+                count = 0
+                errors = 0
+                for course in courses:
+                    pred_check = select(Prediction).where(Prediction.course_id == course.id)
+                    existing = await db.execute(pred_check)
+                    if existing.scalars().first():
+                        continue
+
+                    try:
+                        await predictor.predict_and_save(db, course)
+                        count += 1
+                    except Exception as e:
+                        logger.error("Erreur prediction course %s: %s", course.id, e)
+                        errors += 1
+
+                    if count % 50 == 0 and count > 0:
+                        await db.commit()
+
+                await db.commit()
+
+                # Marquer les top 5 confiance pour chaque jour concerné
+                jours = set()
+                for course in courses:
+                    jours.add(course.date.date())
+                for jour in jours:
+                    await mark_top5_confiance(db, jour)
+                await db.commit()
+
+            _predict_status = {"state": "done", "result": {"status": "ok", "courses_predites": count, "erreurs": errors}}
         except Exception as e:
-            logger.error("Erreur prediction course %s: %s", course.id, e)
-            errors += 1
+            logger.error("Erreur prédictions en arrière-plan: %s", e)
+            _predict_status = {"state": "done", "result": {"status": "error", "error": str(e)}}
 
-        if count % 50 == 0 and count > 0:
-            await db.commit()
+    asyncio.create_task(_do_predict())
+    return {"status": "started"}
 
-    await db.commit()
 
-    # Marquer les top 5 confiance pour chaque jour concerné
-    from collections import defaultdict as _defaultdict
-    jours = set()
-    for course in courses:
-        jours.add(course.date.date())
-    for jour in jours:
-        await mark_top5_confiance(db, jour)
-    await db.commit()
-
-    return {"status": "ok", "courses_predites": count, "erreurs": errors}
+@app.get("/api/predict/status")
+async def predict_status():
+    """Retourne l'état de la génération de prédictions."""
+    return _predict_status
 
 
 @app.post("/api/backtest")

@@ -61,7 +61,18 @@ export async function postTrain() {
 }
 
 export async function postPredict() {
-  return fetchJSON('/predict', { method: 'POST' })
+  const start = await fetchJSON('/predict', { method: 'POST' })
+  if (start.status !== 'started' && start.status !== 'already_running') {
+    return start
+  }
+
+  while (true) {
+    await new Promise(r => setTimeout(r, 2000))
+    const status = await fetchJSON('/predict/status')
+    if (status.state === 'done') {
+      return status.result
+    }
+  }
 }
 
 export async function postBacktest() {
