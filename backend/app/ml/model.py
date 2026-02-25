@@ -368,8 +368,16 @@ class HippiquePredictor:
         top3_correct = 0
         total_races = 0
         mrr_sum = 0.0
-        roi_gains = 0.0
-        roi_mises = 0.0
+        roi_flat_gains = 0.0
+        roi_flat_mises = 0.0
+        roi_value_gains = 0.0
+        roi_value_mises = 0.0
+        roi_kelly_gains = 0.0
+        roi_kelly_mises = 0.0
+        bankroll = 1000.0  # bankroll simulé pour Kelly
+
+        # Récupérer les cotes originales depuis X_test (index 0 = cote_probable)
+        cotes_test = X_test[:, 0] if X_test.shape[1] > 0 else np.full(len(X_test), np.nan)
 
         idx = 0
         for g in groups_test:
@@ -377,6 +385,7 @@ class HippiquePredictor:
                 continue
             course_probas = calibrated[idx:idx + g]
             course_labels = y_test[idx:idx + g]
+            course_cotes = cotes_test[idx:idx + g]
             idx += g
             total_races += 1
 
@@ -396,12 +405,35 @@ class HippiquePredictor:
                     mrr_sum += 1.0 / rank
                     break
 
-            # ROI simulé (mise 1€ sur le favori modèle)
-            roi_mises += 1.0
-            if course_labels[rankings[0]] == 1:
-                # Approximation: cote = 1/proba
-                p = max(course_probas[rankings[0]], 0.01)
-                roi_gains += 1.0 / p
+            # Favori du modèle
+            fav_idx = rankings[0]
+            fav_prob = course_probas[fav_idx]
+            fav_cote = course_cotes[fav_idx]
+            fav_won = course_labels[fav_idx] == 1
+
+            # ROI mise fixe 1€ sur le favori
+            roi_flat_mises += 1.0
+            if fav_won and not np.isnan(fav_cote) and fav_cote >= 1.0:
+                roi_flat_gains += fav_cote
+            # else: gains += 0 (perte de la mise)
+
+            # ROI Value Bet (ne mise que si prob > 1.3 × prob_implicite)
+            if not np.isnan(fav_cote) and fav_cote >= 1.0:
+                prob_impl = 1.0 / fav_cote
+                if fav_prob > prob_impl * 1.3:
+                    roi_value_mises += 1.0
+                    if fav_won:
+                        roi_value_gains += fav_cote
+
+            # ROI Kelly (demi-Kelly, cap 10%)
+            if not np.isnan(fav_cote) and fav_cote > 1.0:
+                edge = fav_prob * fav_cote - 1.0
+                if edge > 0:
+                    kelly_f = min((edge / (fav_cote - 1.0)) * 0.5, 0.10)
+                    mise_kelly = bankroll * kelly_f
+                    roi_kelly_mises += mise_kelly
+                    if fav_won:
+                        roi_kelly_gains += mise_kelly * fav_cote
 
         metrics = {
             "total_partants": total_partants,
@@ -411,7 +443,10 @@ class HippiquePredictor:
             "log_loss": round(ll, 4),
             "brier_score": round(brier, 4),
             "mrr": round(mrr_sum / max(total_races, 1), 4),
-            "roi_simule": round((roi_gains - roi_mises) / max(roi_mises, 1) * 100, 1),
+            "roi_flat": round((roi_flat_gains - roi_flat_mises) / max(roi_flat_mises, 1) * 100, 1),
+            "roi_value_bet": round((roi_value_gains - roi_value_mises) / max(roi_value_mises, 1) * 100, 1) if roi_value_mises > 0 else None,
+            "roi_value_bet_nb_mises": int(roi_value_mises),
+            "roi_kelly": round((roi_kelly_gains - roi_kelly_mises) / max(roi_kelly_mises, 1) * 100, 1) if roi_kelly_mises > 0 else None,
         }
         return metrics
 
@@ -529,12 +564,26 @@ class HippiquePredictor:
         for i, row in enumerate(rows):
             prob = float(probas[i])
             cote = row["features"][0]  # cote_probable
-            # Guard NaN for value bet
-            if np.isnan(cote) or np.isnan(prob):
+            # Guard NaN for value bet & Kelly
+            if np.isnan(cote) or np.isnan(prob) or cote < 1.0:
                 is_value = False
+                kelly_fraction = 0.0
+                kelly_mise = 0.0
             else:
                 prob_implicite = 1.0 / max(cote, 1.0)
-                is_value = prob > prob_implicite * 1.2
+                # Value bet : prob modèle > 1.3× prob implicite (marge 30%)
+                is_value = prob > prob_implicite * 1.3
+                # Kelly Criterion : f = (p*b - 1) / (b - 1) où b = cote, p = prob modèle
+                b = cote
+                edge = prob * b - 1.0
+                if edge > 0 and b > 1.0:
+                    kelly_fraction = edge / (b - 1.0)
+                    # Demi-Kelly pour limiter la variance
+                    kelly_fraction = min(kelly_fraction * 0.5, 0.10)  # cap à 10% du bankroll
+                    kelly_mise = round(kelly_fraction * 100, 2)  # en % du bankroll
+                else:
+                    kelly_fraction = 0.0
+                    kelly_mise = 0.0
 
             results.append({
                 "partant_id": row["partant_id"],
@@ -542,6 +591,8 @@ class HippiquePredictor:
                 "numero": row["numero"],
                 "probabilite": prob,
                 "is_value_bet": is_value,
+                "kelly_fraction": kelly_fraction,
+                "kelly_mise_pct": kelly_mise,
                 "_rank_score": float(rank_scores[i]) if rank_scores is not None else prob,
             })
 
