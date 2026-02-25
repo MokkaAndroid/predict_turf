@@ -2,7 +2,6 @@ from datetime import datetime, date, timedelta
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.models import Course, Partant, Prediction, Cheval, Jockey, Entraineur
@@ -28,8 +27,12 @@ async def courses_passees(
     hippodrome: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
+    # Requête unique avec LEFT JOIN pour éviter les N+1
     stmt = (
-        select(Course)
+        select(Course, Prediction, Partant, Cheval)
+        .outerjoin(Prediction, and_(Prediction.course_id == Course.id, Prediction.rang_predit == 1))
+        .outerjoin(Partant, Partant.id == Prediction.partant_id)
+        .outerjoin(Cheval, Cheval.id == Partant.cheval_id)
         .where(Course.statut == "TERMINE")
         .order_by(Course.date.desc())
     )
@@ -37,43 +40,10 @@ async def courses_passees(
         stmt = stmt.where(Course.hippodrome.ilike(f"%{hippodrome}%"))
     stmt = stmt.offset(offset).limit(limit)
     result = await db.execute(stmt)
-    courses = result.scalars().all()
+    rows = result.all()
 
     items = []
-    for c in courses:
-        # Chercher la prédiction rang 1 pour cette course
-        pred_stmt = (
-            select(Prediction)
-            .where(Prediction.course_id == c.id, Prediction.rang_predit == 1)
-        )
-        pred_result = await db.execute(pred_stmt)
-        pred = pred_result.scalar_one_or_none()
-
-        favori_nom = None
-        favori_confiance = None
-        is_top5 = False
-        pred_gagnant = None
-        pred_place = None
-        gain_g = None
-        gain_p = None
-
-        if pred:
-            # Récupérer le nom du cheval
-            partant_stmt = select(Partant).where(Partant.id == pred.partant_id)
-            pr = await db.execute(partant_stmt)
-            partant = pr.scalar_one_or_none()
-            if partant:
-                cheval_stmt = select(Cheval).where(Cheval.id == partant.cheval_id)
-                cr = await db.execute(cheval_stmt)
-                cheval = cr.scalar_one_or_none()
-                favori_nom = cheval.nom if cheval else None
-            favori_confiance = pred.score_confiance
-            is_top5 = pred.top5_confiance
-            pred_gagnant = pred.resultat_gagnant
-            pred_place = pred.resultat_place
-            gain_g = pred.gain_gagnant
-            gain_p = pred.gain_place
-
+    for c, pred, partant, cheval in rows:
         items.append(CourseListSchema(
             id=c.id,
             pmu_id=c.pmu_id,
@@ -85,13 +55,13 @@ async def courses_passees(
             distance=c.distance,
             nombre_partants=c.nombre_partants,
             statut=c.statut,
-            favori_nom=favori_nom,
-            favori_confiance=favori_confiance,
-            top5_confiance=is_top5,
-            prediction_correcte_gagnant=pred_gagnant,
-            prediction_correcte_place=pred_place,
-            gain_simule_gagnant=gain_g,
-            gain_simule_place=gain_p,
+            favori_nom=cheval.nom if cheval else None,
+            favori_confiance=pred.score_confiance if pred else None,
+            top5_confiance=pred.top5_confiance if pred else False,
+            prediction_correcte_gagnant=pred.resultat_gagnant if pred else None,
+            prediction_correcte_place=pred.resultat_place if pred else None,
+            gain_simule_gagnant=pred.gain_gagnant if pred else None,
+            gain_simule_place=pred.gain_place if pred else None,
         ))
     return items
 
@@ -102,38 +72,19 @@ async def courses_a_venir(
     db: AsyncSession = Depends(get_db),
 ):
     stmt = (
-        select(Course)
+        select(Course, Prediction, Partant, Cheval)
+        .outerjoin(Prediction, and_(Prediction.course_id == Course.id, Prediction.rang_predit == 1))
+        .outerjoin(Partant, Partant.id == Prediction.partant_id)
+        .outerjoin(Cheval, Cheval.id == Partant.cheval_id)
         .where(Course.statut == "A_VENIR")
         .order_by(Course.date.asc())
         .limit(limit)
     )
     result = await db.execute(stmt)
-    courses = result.scalars().all()
+    rows = result.all()
 
     items = []
-    for c in courses:
-        pred_stmt = (
-            select(Prediction)
-            .where(Prediction.course_id == c.id, Prediction.rang_predit == 1)
-        )
-        pred_result = await db.execute(pred_stmt)
-        pred = pred_result.scalar_one_or_none()
-
-        favori_nom = None
-        favori_confiance = None
-        is_top5 = False
-        if pred:
-            partant_stmt = select(Partant).where(Partant.id == pred.partant_id)
-            pr = await db.execute(partant_stmt)
-            partant = pr.scalar_one_or_none()
-            if partant:
-                cheval_stmt = select(Cheval).where(Cheval.id == partant.cheval_id)
-                cr = await db.execute(cheval_stmt)
-                cheval = cr.scalar_one_or_none()
-                favori_nom = cheval.nom if cheval else None
-            favori_confiance = pred.score_confiance
-            is_top5 = pred.top5_confiance
-
+    for c, pred, partant, cheval in rows:
         items.append(CourseListSchema(
             id=c.id,
             pmu_id=c.pmu_id,
@@ -145,9 +96,9 @@ async def courses_a_venir(
             distance=c.distance,
             nombre_partants=c.nombre_partants,
             statut=c.statut,
-            favori_nom=favori_nom,
-            favori_confiance=favori_confiance,
-            top5_confiance=is_top5,
+            favori_nom=cheval.nom if cheval else None,
+            favori_confiance=pred.score_confiance if pred else None,
+            top5_confiance=pred.top5_confiance if pred else False,
         ))
     return items
 
