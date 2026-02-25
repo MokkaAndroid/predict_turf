@@ -1,6 +1,7 @@
 """
 Point d'entrée FastAPI — Application de Prévisions Hippiques.
 """
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -23,6 +24,9 @@ from app.models import Course, Prediction
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ── État global pour les tâches longues en arrière-plan ────────
+_train_status: dict = {"state": "idle"}
 
 
 async def mark_top5_confiance(db: AsyncSession, target_date: date):
@@ -198,10 +202,32 @@ async def daily_update(db: AsyncSession = Depends(get_db)):
 
 
 @app.post("/api/train")
-async def train_model(db: AsyncSession = Depends(get_db)):
-    """Entraîne le modèle ML sur les données historiques."""
-    metrics = await predictor.train(db)
-    return {"status": "ok", "metrics": metrics}
+async def train_model():
+    """Lance l'entraînement du modèle ML en arrière-plan."""
+    global _train_status
+    if _train_status.get("state") == "running":
+        return {"status": "already_running"}
+
+    _train_status = {"state": "running"}
+
+    async def _do_train():
+        global _train_status
+        try:
+            async with async_session() as db:
+                metrics = await predictor.train(db)
+            _train_status = {"state": "done", "result": {"status": "ok", "metrics": metrics}}
+        except Exception as e:
+            logger.error("Erreur entraînement en arrière-plan: %s", e)
+            _train_status = {"state": "done", "result": {"status": "error", "error": str(e)}}
+
+    asyncio.create_task(_do_train())
+    return {"status": "started"}
+
+
+@app.get("/api/train/status")
+async def train_status():
+    """Retourne l'état de l'entraînement en cours."""
+    return _train_status
 
 
 @app.post("/api/tune")

@@ -41,7 +41,23 @@ export async function postCollectToday() {
 }
 
 export async function postTrain() {
-  return fetchJSON('/train', { method: 'POST' })
+  // Lance l'entraînement en arrière-plan
+  const start = await fetchJSON('/train', { method: 'POST' })
+  if (start.status === 'already_running') {
+    // Si déjà en cours, on attend quand même le résultat
+  } else if (start.status !== 'started') {
+    return start
+  }
+
+  // Poll le statut toutes les 2 secondes jusqu'à la fin
+  while (true) {
+    await new Promise(r => setTimeout(r, 2000))
+    const status = await fetchJSON('/train/status')
+    if (status.state === 'done') {
+      return status.result
+    }
+    // state === 'running' → on continue de poller
+  }
 }
 
 export async function postPredict() {
