@@ -203,11 +203,17 @@ async def daily_update(db: AsyncSession = Depends(get_db)):
 
 
 @app.post("/api/train")
-async def train_model():
-    """Lance l'entraînement du modèle ML en arrière-plan."""
+async def train_model(
+    train_end: str = Query("2026-01-31", description="Dernière date d'entraînement (YYYY-MM-DD)"),
+    test_start: str = Query("2026-02-01", description="Première date du test set (YYYY-MM-DD)"),
+):
+    """Lance l'entraînement du modèle ML en arrière-plan avec split temporel."""
     global _train_status
     if _train_status.get("state") == "running":
         return {"status": "already_running"}
+
+    train_end_date = date.fromisoformat(train_end)
+    test_start_date = date.fromisoformat(test_start)
 
     _train_status = {"state": "running"}
 
@@ -215,7 +221,7 @@ async def train_model():
         global _train_status
         try:
             async with async_session() as db:
-                metrics = await predictor.train(db)
+                metrics = await predictor.train(db, train_end=train_end_date, test_start=test_start_date)
             _train_status = {"state": "done", "result": {"status": "ok", "metrics": metrics}}
         except Exception as e:
             logger.error("Erreur entraînement en arrière-plan: %s", e)
@@ -254,7 +260,7 @@ async def predict_all():
         global _predict_status
         try:
             async with async_session() as db:
-                stmt = select(Course).where(Course.statut.in_(["A_VENIR", "TERMINE"]))
+                stmt = select(Course).where(Course.statut == "A_VENIR")
                 result = await db.execute(stmt)
                 courses = result.scalars().all()
 

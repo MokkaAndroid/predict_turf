@@ -44,6 +44,8 @@ export default function Admin() {
   const [results, setResults] = useState({})
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
+  const [trainEnd, setTrainEnd] = useState('2026-01-31')
+  const [testStart, setTestStart] = useState('2026-02-01')
 
   const run = async (key, fn) => {
     setLoading(prev => ({ ...prev, [key]: true }))
@@ -100,8 +102,43 @@ export default function Admin() {
           )}
         </div>
 
-        <ActionButton label="Entrainer le modele" description="Entraine le modele ML (LightGBM) sur toutes les courses terminees."
-          onClick={() => run('train', postTrain)} loading={loading.train} result={results.train} icon={Brain} color="blue" />
+        <div className="card p-5 hover:shadow-md transition-all duration-200">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-xl bg-stone-100 flex items-center justify-center flex-shrink-0">
+              <Brain className="w-4.5 h-4.5 text-stone-500" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <h3 className="font-semibold text-stone-800 text-sm">Entrainer le modele</h3>
+              <p className="text-xs text-stone-400 mt-1 leading-relaxed">Split temporel : evalue sur le test set puis re-entraine sur toutes les donnees.</p>
+            </div>
+          </div>
+          <div className="mt-4 space-y-2">
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-stone-500 w-20 flex-shrink-0">Train fin</label>
+              <input type="date" value={trainEnd} onChange={e => setTrainEnd(e.target.value)}
+                className="flex-1 bg-white border border-stone-200 rounded-xl px-3 py-2 text-sm text-stone-700 focus:outline-none focus:border-blue-300 focus:ring-2 focus:ring-blue-100" />
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-stone-500 w-20 flex-shrink-0">Test debut</label>
+              <input type="date" value={testStart} onChange={e => setTestStart(e.target.value)}
+                className="flex-1 bg-white border border-stone-200 rounded-xl px-3 py-2 text-sm text-stone-700 focus:outline-none focus:border-blue-300 focus:ring-2 focus:ring-blue-100" />
+            </div>
+          </div>
+          <button onClick={() => run('train', () => postTrain(trainEnd, testStart))} disabled={loading.train || !trainEnd || !testStart}
+            className="mt-3 w-full px-4 py-2.5 rounded-xl text-white text-sm font-semibold bg-blue-600 hover:bg-blue-500 shadow-sm hover:shadow-md transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed hover:-translate-y-0.5 active:translate-y-0 flex items-center justify-center gap-2">
+            {loading.train ? <><Loader2 className="w-4 h-4 animate-spin" /> En cours...</> : 'Entrainer'}
+          </button>
+          {results.train && (
+            <div className="mt-3 relative">
+              <div className={`absolute top-2 right-2 ${results.train.error ? 'text-red-500' : 'text-green-500'}`}>
+                {results.train.error ? <XCircle className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}
+              </div>
+              <pre className="bg-stone-50 border border-stone-200 rounded-xl p-3 text-[11px] text-stone-600 overflow-auto max-h-40 font-mono">
+                {JSON.stringify(results.train, null, 2)}
+              </pre>
+            </div>
+          )}
+        </div>
 
         <ActionButton label="Generer les predictions" description="Genere les predictions pour toutes les courses a venir."
           onClick={() => run('predict', postPredict)} loading={loading.predict} result={results.predict} icon={Target} color="gold" />

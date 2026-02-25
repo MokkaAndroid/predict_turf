@@ -40,9 +40,10 @@ export async function postCollectToday() {
   return fetchJSON('/collect/today', { method: 'POST' })
 }
 
-export async function postTrain() {
-  // Lance l'entraînement en arrière-plan
-  const start = await fetchJSON('/train', { method: 'POST' })
+export async function postTrain(trainEnd = '2026-01-31', testStart = '2026-02-01') {
+  // Lance l'entraînement en arrière-plan avec split temporel
+  const params = new URLSearchParams({ train_end: trainEnd, test_start: testStart })
+  const start = await fetchJSON(`/train?${params}`, { method: 'POST' })
   if (start.status === 'already_running') {
     // Si déjà en cours, on attend quand même le résultat
   } else if (start.status !== 'started') {

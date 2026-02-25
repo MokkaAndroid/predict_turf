@@ -8,6 +8,7 @@ Modèle de prédiction hippique.
 import logging
 import os
 import pickle
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -191,43 +192,190 @@ class HippiquePredictor:
 
     # ── Train ──────────────────────────────────────────────────────
 
-    async def train(self, session: AsyncSession) -> dict:
-        """Entraîne l'ensemble de modèles. Retourne les métriques."""
+    async def train(self, session: AsyncSession,
+                    train_end: date | None = None,
+                    test_start: date | None = None) -> dict:
+        """Entraîne l'ensemble de modèles avec split temporel.
+
+        Phase 1 : Évaluation honnête (train sur courses <= train_end, test sur >= test_start)
+        Phase 2 : Re-entraînement final sur TOUTES les données TERMINE pour la production
+        """
         if not HAS_LGB:
             return {"error": "LightGBM non disponible"}
+
+        if train_end is None:
+            train_end = date(2026, 1, 31)
+        if test_start is None:
+            test_start = date(2026, 2, 1)
 
         # Fetch all completed courses
         stmt = select(Course).where(Course.statut == "TERMINE").order_by(Course.date.asc())
         result = await session.execute(stmt)
-        courses = result.scalars().all()
+        all_courses = result.scalars().all()
 
-        if len(courses) < 20:
-            return {"error": f"Pas assez de courses ({len(courses)}). Minimum 20."}
+        if len(all_courses) < 20:
+            return {"error": f"Pas assez de courses ({len(all_courses)}). Minimum 20."}
 
-        # Build features for all courses
+        # ── Split temporel ────────────────────────────────
+        train_courses = [c for c in all_courses if c.date.date() <= train_end]
+        test_courses = [c for c in all_courses if c.date.date() >= test_start]
+
+        if len(train_courses) < 15:
+            return {"error": f"Pas assez de courses d'entraînement ({len(train_courses)}). Minimum 15."}
+        if len(test_courses) < 5:
+            return {"error": f"Pas assez de courses de test ({len(test_courses)}). Minimum 5."}
+
+        logger.info("Split temporel : %d courses train (<= %s), %d courses test (>= %s)",
+                     len(train_courses), train_end, len(test_courses), test_start)
+
+        # ══════════════════════════════════════════════════
+        # PHASE 1 — Évaluation honnête (out-of-sample)
+        # ══════════════════════════════════════════════════
+
+        # Build features for train courses
+        train_all_rows = []
+        for course in train_courses:
+            rows = await build_features_for_course(session, course)
+            train_all_rows.append(rows)
+
+        X_train_full, y_train_full, groups_train_full = self._build_dataset(train_courses, train_all_rows)
+
+        # Split interne train : 85% train / 15% calib
+        n_tr, n_cal, g_tr, g_cal = self._split_by_groups(groups_train_full, train_frac=0.85, calib_frac=0.15)
+
+        X_tr, y_tr = X_train_full[:n_tr], y_train_full[:n_tr]
+        X_cal, y_cal = X_train_full[n_tr:n_tr + n_cal], y_train_full[n_tr:n_tr + n_cal]
+        groups_tr = groups_train_full[:g_tr]
+
+        if len(X_tr) == 0 or len(X_cal) == 0:
+            return {"error": "Pas assez de données pour le split train/calib"}
+
+        logger.info("Phase 1 — Dataset train: %d partants, calib: %d partants",
+                     len(y_tr), len(y_cal))
+
+        # Build features for test courses
+        test_all_rows = []
+        for course in test_courses:
+            rows = await build_features_for_course(session, course)
+            test_all_rows.append(rows)
+
+        X_test, y_test, groups_test = self._build_dataset(test_courses, test_all_rows)
+
+        if len(X_test) == 0:
+            return {"error": "Pas assez de données dans le test set"}
+
+        logger.info("Phase 1 — Dataset test: %d partants, %d courses",
+                     len(y_test), len(groups_test))
+
+        # Train classifiers (Phase 1)
+        eval_models, eval_model_names = self._train_classifiers(X_tr, y_tr)
+
+        # Ensemble weights on calib
+        eval_weights = self._find_ensemble_weights(eval_models, X_cal, y_cal)
+        logger.info("Phase 1 — Poids ensemble : %s (%s)", eval_weights, eval_model_names)
+
+        # Calibration on calib
+        blend_cal = self._blend_predict(eval_models, eval_weights, X_cal)
+        eval_calibrator = IsotonicRegression(y_min=0.001, y_max=0.999, out_of_bounds="clip")
+        eval_calibrator.fit(blend_cal, y_cal)
+
+        # Metrics on test set (out-of-sample)
+        # Temporarily set calibrator for _compute_metrics
+        old_calibrator = self.calibrator
+        self.calibrator = eval_calibrator
+        metrics = self._compute_metrics(
+            eval_models, eval_weights, X_test, y_test, groups_test,
+            total_partants=len(y_train_full) + len(y_test),
+        )
+        self.calibrator = old_calibrator
+
+        metrics["eval_train_courses"] = len(train_courses)
+        metrics["eval_test_courses"] = len(test_courses)
+        metrics["eval_train_end"] = str(train_end)
+        metrics["eval_test_start"] = str(test_start)
+
+        logger.info("Phase 1 — Évaluation : top1=%.1f%%, top3=%.1f%%, log_loss=%.4f",
+                     metrics["top1_accuracy"], metrics["top3_accuracy"], metrics["log_loss"])
+
+        # ══════════════════════════════════════════════════
+        # PHASE 2 — Re-entraînement final sur TOUTES les données
+        # ══════════════════════════════════════════════════
+        logger.info("Phase 2 — Re-entraînement sur toutes les %d courses", len(all_courses))
+
         all_rows = []
-        for course in courses:
+        for course in all_courses:
             rows = await build_features_for_course(session, course)
             all_rows.append(rows)
 
-        X, y, groups = self._build_dataset(courses, all_rows)
-        logger.info("Dataset : %d partants, %d gagnants (%.1f%%)", len(y), y.sum(), y.mean() * 100)
+        X_all, y_all, groups_all = self._build_dataset(all_courses, all_rows)
 
-        # Split: train 70% / calib 15% / test 15%
-        n_train, n_calib, g_train, g_calib = self._split_by_groups(groups)
-        n_total = len(y)
+        # Split interne : 85% train / 15% calib
+        n_tr2, n_cal2, g_tr2, g_cal2 = self._split_by_groups(groups_all, train_frac=0.85, calib_frac=0.15)
 
-        X_train, y_train = X[:n_train], y[:n_train]
-        X_calib, y_calib = X[n_train:n_train + n_calib], y[n_train:n_train + n_calib]
-        X_test, y_test = X[n_train + n_calib:], y[n_train + n_calib:]
+        X_tr2, y_tr2 = X_all[:n_tr2], y_all[:n_tr2]
+        X_cal2, y_cal2 = X_all[n_tr2:n_tr2 + n_cal2], y_all[n_tr2:n_tr2 + n_cal2]
+        groups_tr2 = groups_all[:g_tr2]
 
-        groups_train = groups[:g_train]
-        groups_test = groups[g_calib:]
+        # Train final classifiers
+        final_models, model_names = self._train_classifiers(X_tr2, y_tr2)
 
-        if len(X_train) == 0 or len(X_calib) == 0 or len(X_test) == 0:
-            return {"error": "Pas assez de données pour le split train/calib/test"}
+        # Final ensemble weights
+        best_weights = self._find_ensemble_weights(final_models, X_cal2, y_cal2)
+        self.ensemble_weights = best_weights
+        logger.info("Phase 2 — Poids ensemble final : %s (%s)", best_weights, model_names)
 
-        # ── Train classifiers ─────────────────────────────
+        # Final calibration
+        blend_cal2 = self._blend_predict(final_models, best_weights, X_cal2)
+        self.calibrator = IsotonicRegression(y_min=0.001, y_max=0.999, out_of_bounds="clip")
+        self.calibrator.fit(blend_cal2, y_cal2)
+
+        # Final LambdaRank ranker
+        self.ranker = None
+        if len(groups_tr2) >= 5:
+            try:
+                rank_labels = self._build_ranking_labels(all_rows[:g_tr2])
+                if len(rank_labels) == len(X_tr2):
+                    ranker = lgb.LGBMRanker(
+                        objective="lambdarank",
+                        n_estimators=200,
+                        learning_rate=0.05,
+                        max_depth=6,
+                        num_leaves=31,
+                        min_child_samples=10,
+                        verbose=-1,
+                    )
+                    ranker.fit(X_tr2, rank_labels, group=groups_tr2)
+                    self.ranker = ranker
+                    logger.info("Phase 2 — LGBMRanker entraîné avec succès")
+            except Exception as e:
+                logger.warning("Phase 2 — Échec LGBMRanker : %s", e)
+
+        self.model = final_models
+        self._save_model()
+
+        # Feature importance (from final LightGBM)
+        lgb_final = final_models[0]
+        if hasattr(lgb_final, "feature_importances_"):
+            importances = lgb_final.feature_importances_
+            fi = sorted(zip(FEATURE_NAMES, importances), key=lambda x: -x[1])
+            metrics["feature_importance"] = {name: float(imp) for name, imp in fi}
+
+        metrics["feature_names"] = FEATURE_NAMES
+        metrics["ensemble_models"] = model_names
+        metrics["ensemble_weights"] = [float(w) for w in best_weights]
+        metrics["final_model_total_courses"] = len(all_courses)
+        metrics["note"] = (
+            f"Métriques évaluées sur le test set ({test_start} et après). "
+            f"Le modèle sauvegardé a été re-entraîné sur TOUTES les {len(all_courses)} courses "
+            f"pour une utilisation en production."
+        )
+
+        logger.info("Entraînement terminé : top1=%.1f%%, top3=%.1f%%, log_loss=%.4f",
+                     metrics["top1_accuracy"], metrics["top3_accuracy"], metrics["log_loss"])
+        return metrics
+
+    def _train_classifiers(self, X_train, y_train):
+        """Train all available classifiers. Returns (models, model_names)."""
         lgb_params = dict(_DEFAULT_LGB_PARAMS)
         if self.best_params and "lgb" in self.best_params:
             lgb_params.update(self.best_params["lgb"])
@@ -258,59 +406,7 @@ class HippiquePredictor:
             models.append(cat_model)
             model_names.append("CatBoost")
 
-        # ── Find optimal ensemble weights on calib set ────
-        best_weights = self._find_ensemble_weights(models, X_calib, y_calib)
-        self.ensemble_weights = best_weights
-        logger.info("Poids ensemble : %s (%s)", best_weights, model_names)
-
-        # ── Calibration isotonique on calib set ───────────
-        blend_calib = self._blend_predict(models, best_weights, X_calib)
-        self.calibrator = IsotonicRegression(y_min=0.001, y_max=0.999, out_of_bounds="clip")
-        self.calibrator.fit(blend_calib, y_calib)
-
-        # ── LambdaRank ranker ─────────────────────────────
-        self.ranker = None
-        if len(groups_train) >= 5:
-            try:
-                rank_labels = self._build_ranking_labels(all_rows[:g_train])
-                if len(rank_labels) == len(X_train):
-                    ranker = lgb.LGBMRanker(
-                        objective="lambdarank",
-                        n_estimators=200,
-                        learning_rate=0.05,
-                        max_depth=6,
-                        num_leaves=31,
-                        min_child_samples=10,
-                        verbose=-1,
-                    )
-                    ranker.fit(X_train, rank_labels, group=groups_train)
-                    self.ranker = ranker
-                    logger.info("LGBMRanker entraîné avec succès")
-            except Exception as e:
-                logger.warning("Échec LGBMRanker : %s", e)
-
-        self.model = models
-        self._save_model()
-
-        # ── Metrics on test set ───────────────────────────
-        metrics = self._compute_metrics(
-            models, best_weights, X_test, y_test, groups_test,
-            total_partants=len(y),
-        )
-
-        # Feature importance (from LightGBM)
-        if hasattr(lgb_model, "feature_importances_"):
-            importances = lgb_model.feature_importances_
-            fi = sorted(zip(FEATURE_NAMES, importances), key=lambda x: -x[1])
-            metrics["feature_importance"] = {name: float(imp) for name, imp in fi}
-
-        metrics["feature_names"] = FEATURE_NAMES
-        metrics["ensemble_models"] = model_names
-        metrics["ensemble_weights"] = [float(w) for w in best_weights]
-
-        logger.info("Entraînement terminé : top1=%.1f%%, top3=%.1f%%, log_loss=%.4f",
-                     metrics["top1_accuracy"], metrics["top3_accuracy"], metrics["log_loss"])
-        return metrics
+        return models, model_names
 
     def _blend_predict(self, models, weights, X):
         """Weighted average of model predict_proba."""
