@@ -20,8 +20,10 @@ export async function getCourseDetail(id) {
   return fetchJSON(`/course/${id}`)
 }
 
-export async function getBacktestingStats(mise = 1) {
-  return fetchJSON(`/backtesting/stats?mise=${mise}`)
+export async function getBacktestingStats(mise = 1, dateFrom = null) {
+  const params = new URLSearchParams({ mise })
+  if (dateFrom) params.set('date_from', dateFrom)
+  return fetchJSON(`/backtesting/stats?${params}`)
 }
 
 export async function getPrevisionsJour() {

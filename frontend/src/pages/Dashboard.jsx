@@ -45,10 +45,11 @@ export default function Dashboard() {
   const [bilanVeille, setBilanVeille] = useState(null)
   const [confianceStats, setConfianceStats] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [dateFrom, setDateFrom] = useState('2026-02-01')
 
   useEffect(() => {
     Promise.all([
-      getBacktestingStats().catch(() => null),
+      getBacktestingStats(1, dateFrom).catch(() => null),
       getCoursesPassees(20).catch(() => []),
       getCoursesAVenir(10).catch(() => []),
       getPrevisionsJour().catch(() => []),
@@ -63,7 +64,7 @@ export default function Dashboard() {
       setConfianceStats(cs)
       setLoading(false)
     })
-  }, [])
+  }, [dateFrom])
 
   if (loading) {
     return (
@@ -98,9 +99,20 @@ export default function Dashboard() {
         <p className="text-stone-400 mt-1">Vue d'ensemble de vos performances</p>
       </div>
 
+      <div className="flex items-center gap-3">
+        <label htmlFor="dateFrom" className="text-sm font-semibold text-stone-500">Depuis le</label>
+        <input
+          id="dateFrom"
+          type="date"
+          value={dateFrom}
+          onChange={e => setDateFrom(e.target.value)}
+          className="border border-stone-200 rounded-lg px-3 py-1.5 text-sm font-mono text-stone-700 bg-white focus:outline-none focus:ring-2 focus:ring-racing-200 focus:border-racing-400"
+        />
+      </div>
+
       {stats ? (
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-          <StatCard label="Courses analysees" value={stats.total_courses} icon={BarChart3} positive />
+          <StatCard label="Courses analysees" value={stats.total_courses} sub={`depuis le ${new Date(dateFrom).toLocaleDateString('fr-FR')}`} icon={BarChart3} positive />
           <StatCard
             label="Taux gagnant"
             value={`${stats.taux_gagnant}%`}

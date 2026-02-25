@@ -292,18 +292,29 @@ async def previsions_jour(
 @router.get("/backtesting/stats", response_model=BacktestingStatsSchema)
 async def backtesting_stats(
     mise: float = Query(1.0, description="Mise unitaire en €"),
+    date_from: str | None = Query(None, description="Date de début au format YYYY-MM-DD"),
     db: AsyncSession = Depends(get_db),
 ):
     """Statistiques globales de backtesting sur toutes les courses terminées."""
+    # Filtre date optionnel
+    date_filter = []
+    if date_from:
+        try:
+            dt_from = datetime.strptime(date_from, "%Y-%m-%d")
+            date_filter.append(Course.date >= dt_from)
+        except ValueError:
+            pass
+
     # Total courses terminées
-    total_stmt = select(func.count(Course.id)).where(Course.statut == "TERMINE")
+    total_stmt = select(func.count(Course.id)).where(Course.statut == "TERMINE", *date_filter)
     total_result = await db.execute(total_stmt)
     total_courses = total_result.scalar() or 0
 
     # Courses avec prédiction rang 1
     pred_stmt = (
         select(Prediction)
-        .where(Prediction.rang_predit == 1, Prediction.resultat_gagnant.is_not(None))
+        .join(Course, Course.id == Prediction.course_id)
+        .where(Prediction.rang_predit == 1, Prediction.resultat_gagnant.is_not(None), *date_filter)
     )
     pred_result = await db.execute(pred_stmt)
     preds = pred_result.scalars().all()
