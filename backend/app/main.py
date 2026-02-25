@@ -204,6 +204,16 @@ async def train_model(db: AsyncSession = Depends(get_db)):
     return {"status": "ok", "metrics": metrics}
 
 
+@app.post("/api/tune")
+async def tune_model(
+    n_trials: int = Query(50, description="Nombre d'essais Optuna"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lance le tuning des hyperparamètres avec Optuna."""
+    result = await predictor.tune(db, n_trials=n_trials)
+    return {"status": "ok", **result}
+
+
 @app.post("/api/predict")
 async def predict_all(db: AsyncSession = Depends(get_db)):
     """Génère les prédictions pour toutes les courses non encore prédites (A_VENIR + TERMINE)."""

@@ -20,15 +20,25 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-        # Migration : ajouter la colonne top5_confiance si elle n'existe pas
         from sqlalchemy import text, inspect
-        def _check_column(sync_conn):
-            insp = inspect(sync_conn)
-            columns = [col["name"] for col in insp.get_columns("predictions")]
-            return "top5_confiance" in columns
 
-        has_col = await conn.run_sync(_check_column)
-        if not has_col:
-            await conn.execute(
-                text("ALTER TABLE predictions ADD COLUMN top5_confiance BOOLEAN DEFAULT FALSE")
-            )
+        # Auto-migration: add missing columns to existing tables
+        _migrations = [
+            ("predictions", "top5_confiance", "BOOLEAN DEFAULT FALSE"),
+            ("chevaux", "gains_carriere", "FLOAT"),
+            ("partants", "rang_pronostic", "INTEGER"),
+        ]
+
+        def _get_existing_columns(sync_conn, table_name):
+            insp = inspect(sync_conn)
+            try:
+                return [col["name"] for col in insp.get_columns(table_name)]
+            except Exception:
+                return []
+
+        for table, column, col_type in _migrations:
+            existing = await conn.run_sync(lambda sc, t=table: _get_existing_columns(sc, t))
+            if column not in existing:
+                await conn.execute(
+                    text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+                )

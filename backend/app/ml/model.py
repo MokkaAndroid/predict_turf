@@ -1,7 +1,9 @@
 """
 Modèle de prédiction hippique.
-Utilise LightGBM en mode classification binaire (gagnant / non-gagnant).
-Walk-forward validation pour éviter le data leakage.
+- Ensemble LightGBM + XGBoost + CatBoost (classification binaire)
+- LGBMRanker (LambdaRank) pour l'ordre
+- Calibration Platt/Isotonique sur partition séparée (pas de leakage)
+- Optuna pour le tuning des hyperparamètres
 """
 import logging
 import os
@@ -10,13 +12,32 @@ from pathlib import Path
 
 import numpy as np
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import log_loss, brier_score_loss
 
 try:
     import lightgbm as lgb
     HAS_LGB = True
 except ImportError:
     HAS_LGB = False
+
+try:
+    import xgboost as xgb
+    HAS_XGB = True
+except ImportError:
+    HAS_XGB = False
+
+try:
+    from catboost import CatBoostClassifier
+    HAS_CAT = True
+except ImportError:
+    HAS_CAT = False
+
+try:
+    import optuna
+    HAS_OPTUNA = True
+except ImportError:
+    HAS_OPTUNA = False
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,140 +50,452 @@ logger = logging.getLogger(__name__)
 MODEL_DIR = Path(__file__).parent / "saved"
 MODEL_PATH = MODEL_DIR / "model.pkl"
 
+# Default hyperparams (overridden by Optuna)
+_DEFAULT_LGB_PARAMS = dict(
+    n_estimators=300,
+    learning_rate=0.05,
+    max_depth=6,
+    num_leaves=31,
+    min_child_samples=20,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_alpha=0.1,
+    reg_lambda=1.0,
+    class_weight="balanced",
+    random_state=42,
+    verbose=-1,
+)
+
+_DEFAULT_XGB_PARAMS = dict(
+    n_estimators=300,
+    learning_rate=0.05,
+    max_depth=6,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_alpha=0.1,
+    reg_lambda=1.0,
+    scale_pos_weight=1.0,  # will be computed dynamically
+    random_state=42,
+    eval_metric="logloss",
+    verbosity=0,
+)
+
+_DEFAULT_CAT_PARAMS = dict(
+    iterations=300,
+    learning_rate=0.05,
+    depth=6,
+    l2_leaf_reg=3.0,
+    random_seed=42,
+    verbose=0,
+    auto_class_weights="Balanced",
+)
+
 
 class HippiquePredictor:
     def __init__(self):
-        self.model = None
+        self.model = None          # ensemble dict or legacy model
+        self.ranker = None         # LGBMRanker
+        self.calibrator = None     # IsotonicRegression
+        self.ensemble_weights = None
+        self.best_params = None    # from Optuna
         self._load_model()
 
     def _load_model(self):
         if MODEL_PATH.exists():
             with open(MODEL_PATH, "rb") as f:
-                self.model = pickle.load(f)
-            logger.info("Modèle chargé depuis %s", MODEL_PATH)
+                data = pickle.load(f)
+            if isinstance(data, dict) and "ensemble" in data:
+                self.model = data["ensemble"]
+                self.ranker = data.get("ranker")
+                self.calibrator = data.get("calibrator")
+                self.ensemble_weights = data.get("weights", [1.0])
+                self.best_params = data.get("best_params")
+                logger.info("Modèle ensemble chargé depuis %s", MODEL_PATH)
+            else:
+                # Legacy model (CalibratedClassifierCV)
+                self.model = data
+                logger.info("Modèle legacy chargé depuis %s", MODEL_PATH)
 
     def _save_model(self):
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        data = {
+            "ensemble": self.model,
+            "ranker": self.ranker,
+            "calibrator": self.calibrator,
+            "weights": self.ensemble_weights,
+            "best_params": self.best_params,
+        }
         with open(MODEL_PATH, "wb") as f:
-            pickle.dump(self.model, f)
+            pickle.dump(data, f)
         logger.info("Modèle sauvegardé dans %s", MODEL_PATH)
 
+    # ── Helpers ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_dataset(courses, all_rows):
+        """Flatten course rows into X, y, groups arrays."""
+        X_list, y_list, groups = [], [], []
+        for course, rows in zip(courses, all_rows):
+            valid = [r for r in rows if r["is_winner"] is not None]
+            if not valid:
+                continue
+            for r in valid:
+                X_list.append(r["features"])
+                y_list.append(1 if r["is_winner"] else 0)
+            groups.append(len(valid))
+        return np.array(X_list), np.array(y_list), groups
+
+    @staticmethod
+    def _build_ranking_labels(all_rows):
+        """Build relevance labels for LambdaRank: higher = better."""
+        labels = []
+        for rows in all_rows:
+            valid = [r for r in rows if r["is_winner"] is not None]
+            if not valid:
+                continue
+            nb = len(valid)
+            for r in valid:
+                cl = r.get("classement")
+                if cl is not None and cl > 0:
+                    labels.append(max(nb - cl + 1, 0))
+                elif r["is_winner"]:
+                    labels.append(nb)
+                else:
+                    labels.append(0)
+        return np.array(labels)
+
+    @staticmethod
+    def _split_by_groups(groups, train_frac=0.70, calib_frac=0.15):
+        """Split course groups into train/calib/test indices."""
+        total = sum(groups)
+        cum = np.cumsum(groups)
+        train_end = int(total * train_frac)
+        calib_end = int(total * (train_frac + calib_frac))
+
+        train_idx = 0
+        for i, c in enumerate(cum):
+            if c >= train_end:
+                train_idx = i + 1
+                break
+
+        calib_idx = train_idx
+        for i in range(train_idx, len(cum)):
+            if cum[i] >= calib_end:
+                calib_idx = i + 1
+                break
+
+        n_train = int(cum[train_idx - 1]) if train_idx > 0 else 0
+        n_calib = int(cum[calib_idx - 1]) - n_train if calib_idx > train_idx else 0
+
+        return n_train, n_calib, train_idx, calib_idx
+
+    # ── Train ──────────────────────────────────────────────────────
+
     async def train(self, session: AsyncSession) -> dict:
-        """
-        Entraîne le modèle sur toutes les courses terminées.
-        Retourne les métriques de validation.
-        """
+        """Entraîne l'ensemble de modèles. Retourne les métriques."""
         if not HAS_LGB:
-            logger.error("LightGBM non installé")
             return {"error": "LightGBM non disponible"}
 
-        # Récupérer toutes les courses terminées, ordonnées par date
-        stmt = (
-            select(Course)
-            .where(Course.statut == "TERMINE")
-            .order_by(Course.date.asc())
-        )
+        # Fetch all completed courses
+        stmt = select(Course).where(Course.statut == "TERMINE").order_by(Course.date.asc())
         result = await session.execute(stmt)
         courses = result.scalars().all()
 
         if len(courses) < 20:
             return {"error": f"Pas assez de courses ({len(courses)}). Minimum 20."}
 
-        all_X = []
-        all_y = []
-
+        # Build features for all courses
+        all_rows = []
         for course in courses:
             rows = await build_features_for_course(session, course)
-            for row in rows:
-                if row["is_winner"] is not None:
-                    all_X.append(row["features"])
-                    all_y.append(1 if row["is_winner"] else 0)
+            all_rows.append(rows)
 
-        X = np.array(all_X)
-        y = np.array(all_y)
-
+        X, y, groups = self._build_dataset(courses, all_rows)
         logger.info("Dataset : %d partants, %d gagnants (%.1f%%)", len(y), y.sum(), y.mean() * 100)
 
-        # Entraînement LightGBM
-        base_model = lgb.LGBMClassifier(
-            n_estimators=300,
-            learning_rate=0.05,
-            max_depth=6,
-            num_leaves=31,
-            min_child_samples=20,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            class_weight="balanced",
-            random_state=42,
-            verbose=-1,
-        )
+        # Split: train 70% / calib 15% / test 15%
+        n_train, n_calib, g_train, g_calib = self._split_by_groups(groups)
+        n_total = len(y)
 
-        # Walk-forward validation (dernier 20% comme test)
-        split_idx = int(len(X) * 0.8)
-        X_train, X_test = X[:split_idx], X[split_idx:]
-        y_train, y_test = y[:split_idx], y[split_idx:]
+        X_train, y_train = X[:n_train], y[:n_train]
+        X_calib, y_calib = X[n_train:n_train + n_calib], y[n_train:n_train + n_calib]
+        X_test, y_test = X[n_train + n_calib:], y[n_train + n_calib:]
 
-        base_model.fit(X_train, y_train)
+        groups_train = groups[:g_train]
+        groups_test = groups[g_calib:]
 
-        # Calibration Platt
-        self.model = CalibratedClassifierCV(base_model, cv="prefit", method="sigmoid")
-        self.model.fit(X_test, y_test)
+        if len(X_train) == 0 or len(X_calib) == 0 or len(X_test) == 0:
+            return {"error": "Pas assez de données pour le split train/calib/test"}
 
-        # Métriques
-        y_pred_proba = self.model.predict_proba(X_test)[:, 1]
-        top1_correct = 0
-        top3_correct = 0
-        total_races = 0
+        # ── Train classifiers ─────────────────────────────
+        lgb_params = dict(_DEFAULT_LGB_PARAMS)
+        if self.best_params and "lgb" in self.best_params:
+            lgb_params.update(self.best_params["lgb"])
 
-        # Regrouper par course pour calculer top-1 et top-3
-        idx = 0
-        for course in courses[split_idx:]:
-            rows = await build_features_for_course(session, course)
-            valid_rows = [r for r in rows if r["is_winner"] is not None]
-            n = len(valid_rows)
-            if n == 0:
-                continue
+        lgb_model = lgb.LGBMClassifier(**lgb_params)
+        lgb_model.fit(X_train, y_train)
 
-            course_probas = y_pred_proba[idx:idx + n]
-            course_labels = y_test[idx:idx + n]
-            idx += n
+        models = [lgb_model]
+        model_names = ["LightGBM"]
 
-            if len(course_probas) != n:
-                continue
+        if HAS_XGB:
+            xgb_params = dict(_DEFAULT_XGB_PARAMS)
+            pos_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
+            xgb_params["scale_pos_weight"] = pos_weight
+            if self.best_params and "xgb" in self.best_params:
+                xgb_params.update(self.best_params["xgb"])
+            xgb_model = xgb.XGBClassifier(**xgb_params)
+            xgb_model.fit(X_train, y_train)
+            models.append(xgb_model)
+            model_names.append("XGBoost")
 
-            rankings = np.argsort(-course_probas)
-            total_races += 1
-            if course_labels[rankings[0]] == 1:
-                top1_correct += 1
-            if any(course_labels[rankings[i]] == 1 for i in range(min(3, len(rankings)))):
-                top3_correct += 1
+        if HAS_CAT:
+            cat_params = dict(_DEFAULT_CAT_PARAMS)
+            if self.best_params and "cat" in self.best_params:
+                cat_params.update(self.best_params["cat"])
+            cat_model = CatBoostClassifier(**cat_params)
+            cat_model.fit(X_train, y_train)
+            models.append(cat_model)
+            model_names.append("CatBoost")
 
+        # ── Find optimal ensemble weights on calib set ────
+        best_weights = self._find_ensemble_weights(models, X_calib, y_calib)
+        self.ensemble_weights = best_weights
+        logger.info("Poids ensemble : %s (%s)", best_weights, model_names)
+
+        # ── Calibration isotonique on calib set ───────────
+        blend_calib = self._blend_predict(models, best_weights, X_calib)
+        self.calibrator = IsotonicRegression(y_min=0.001, y_max=0.999, out_of_bounds="clip")
+        self.calibrator.fit(blend_calib, y_calib)
+
+        # ── LambdaRank ranker ─────────────────────────────
+        self.ranker = None
+        if len(groups_train) >= 5:
+            try:
+                rank_labels = self._build_ranking_labels(all_rows[:g_train])
+                if len(rank_labels) == len(X_train):
+                    ranker = lgb.LGBMRanker(
+                        objective="lambdarank",
+                        n_estimators=200,
+                        learning_rate=0.05,
+                        max_depth=6,
+                        num_leaves=31,
+                        min_child_samples=10,
+                        verbose=-1,
+                    )
+                    ranker.fit(X_train, rank_labels, group=groups_train)
+                    self.ranker = ranker
+                    logger.info("LGBMRanker entraîné avec succès")
+            except Exception as e:
+                logger.warning("Échec LGBMRanker : %s", e)
+
+        self.model = models
         self._save_model()
 
-        metrics = {
-            "total_partants": len(y),
-            "total_courses_test": total_races,
-            "top1_accuracy": round(top1_correct / max(total_races, 1) * 100, 1),
-            "top3_accuracy": round(top3_correct / max(total_races, 1) * 100, 1),
-            "feature_names": FEATURE_NAMES,
-        }
+        # ── Metrics on test set ───────────────────────────
+        metrics = self._compute_metrics(
+            models, best_weights, X_test, y_test, groups_test,
+            total_partants=len(y),
+        )
 
-        # Feature importance
-        if hasattr(base_model, "feature_importances_"):
-            importances = base_model.feature_importances_
+        # Feature importance (from LightGBM)
+        if hasattr(lgb_model, "feature_importances_"):
+            importances = lgb_model.feature_importances_
             fi = sorted(zip(FEATURE_NAMES, importances), key=lambda x: -x[1])
             metrics["feature_importance"] = {name: float(imp) for name, imp in fi}
 
-        logger.info("Entraînement terminé : %s", metrics)
+        metrics["feature_names"] = FEATURE_NAMES
+        metrics["ensemble_models"] = model_names
+        metrics["ensemble_weights"] = [float(w) for w in best_weights]
+
+        logger.info("Entraînement terminé : top1=%.1f%%, top3=%.1f%%, log_loss=%.4f",
+                     metrics["top1_accuracy"], metrics["top3_accuracy"], metrics["log_loss"])
         return metrics
 
+    def _blend_predict(self, models, weights, X):
+        """Weighted average of model predict_proba."""
+        blend = np.zeros(len(X))
+        for m, w in zip(models, weights):
+            blend += w * m.predict_proba(X)[:, 1]
+        return blend / sum(weights)
+
+    def _find_ensemble_weights(self, models, X, y):
+        """Grid search for optimal blend weights (minimize log_loss)."""
+        if len(models) == 1:
+            return [1.0]
+
+        probas = [m.predict_proba(X)[:, 1] for m in models]
+        best_loss = float("inf")
+        best_weights = [1.0] * len(models)
+
+        # Grid search with step 0.1
+        n = len(models)
+        if n == 2:
+            for w1 in range(0, 11):
+                w = [w1 / 10, (10 - w1) / 10]
+                blend = sum(p * wi for p, wi in zip(probas, w))
+                blend = np.clip(blend, 1e-7, 1 - 1e-7)
+                ll = log_loss(y, blend)
+                if ll < best_loss:
+                    best_loss = ll
+                    best_weights = w
+        elif n == 3:
+            for w1 in range(0, 11):
+                for w2 in range(0, 11 - w1):
+                    w3 = 10 - w1 - w2
+                    w = [w1 / 10, w2 / 10, w3 / 10]
+                    blend = sum(p * wi for p, wi in zip(probas, w))
+                    blend = np.clip(blend, 1e-7, 1 - 1e-7)
+                    ll = log_loss(y, blend)
+                    if ll < best_loss:
+                        best_loss = ll
+                        best_weights = w
+
+        return best_weights
+
+    def _compute_metrics(self, models, weights, X_test, y_test, groups_test, total_partants=0):
+        """Compute enriched metrics on test set."""
+        # Blend predictions
+        blend = self._blend_predict(models, weights, X_test)
+        calibrated = self.calibrator.transform(blend) if self.calibrator else blend
+
+        # Scalar metrics
+        ll = log_loss(y_test, np.clip(calibrated, 1e-7, 1 - 1e-7))
+        brier = brier_score_loss(y_test, calibrated)
+
+        # Per-course metrics
+        top1_correct = 0
+        top3_correct = 0
+        total_races = 0
+        mrr_sum = 0.0
+        roi_gains = 0.0
+        roi_mises = 0.0
+
+        idx = 0
+        for g in groups_test:
+            if g == 0:
+                continue
+            course_probas = calibrated[idx:idx + g]
+            course_labels = y_test[idx:idx + g]
+            idx += g
+            total_races += 1
+
+            rankings = np.argsort(-course_probas)
+
+            # Top-1
+            if course_labels[rankings[0]] == 1:
+                top1_correct += 1
+
+            # Top-3
+            if any(course_labels[rankings[i]] == 1 for i in range(min(3, len(rankings)))):
+                top3_correct += 1
+
+            # MRR
+            for rank, ri in enumerate(rankings, 1):
+                if course_labels[ri] == 1:
+                    mrr_sum += 1.0 / rank
+                    break
+
+            # ROI simulé (mise 1€ sur le favori modèle)
+            roi_mises += 1.0
+            if course_labels[rankings[0]] == 1:
+                # Approximation: cote = 1/proba
+                p = max(course_probas[rankings[0]], 0.01)
+                roi_gains += 1.0 / p
+
+        metrics = {
+            "total_partants": total_partants,
+            "total_courses_test": total_races,
+            "top1_accuracy": round(top1_correct / max(total_races, 1) * 100, 1),
+            "top3_accuracy": round(top3_correct / max(total_races, 1) * 100, 1),
+            "log_loss": round(ll, 4),
+            "brier_score": round(brier, 4),
+            "mrr": round(mrr_sum / max(total_races, 1), 4),
+            "roi_simule": round((roi_gains - roi_mises) / max(roi_mises, 1) * 100, 1),
+        }
+        return metrics
+
+    # ── Tune (Optuna) ──────────────────────────────────────────────
+
+    async def tune(self, session: AsyncSession, n_trials: int = 50) -> dict:
+        """Hyperparameter tuning with Optuna. Returns best params."""
+        if not HAS_OPTUNA:
+            return {"error": "Optuna non installé"}
+        if not HAS_LGB:
+            return {"error": "LightGBM non disponible"}
+
+        from sklearn.model_selection import TimeSeriesSplit
+
+        # Build dataset
+        stmt = select(Course).where(Course.statut == "TERMINE").order_by(Course.date.asc())
+        result = await session.execute(stmt)
+        courses = result.scalars().all()
+
+        if len(courses) < 30:
+            return {"error": f"Pas assez de courses ({len(courses)}). Minimum 30 pour le tuning."}
+
+        all_rows = []
+        for course in courses:
+            rows = await build_features_for_course(session, course)
+            all_rows.append(rows)
+
+        X, y, groups = self._build_dataset(courses, all_rows)
+
+        # Use only 80% for tuning (keep 20% untouched for final eval)
+        n_tune = int(len(X) * 0.8)
+        X_tune, y_tune = X[:n_tune], y[:n_tune]
+
+        tscv = TimeSeriesSplit(n_splits=3)
+
+        def objective(trial):
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 100, 600),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "num_leaves": trial.suggest_int("num_leaves", 15, 63),
+                "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+            }
+
+            scores = []
+            for train_idx, val_idx in tscv.split(X_tune):
+                model = lgb.LGBMClassifier(
+                    class_weight="balanced",
+                    random_state=42,
+                    verbose=-1,
+                    **params,
+                )
+                model.fit(X_tune[train_idx], y_tune[train_idx])
+                pred = model.predict_proba(X_tune[val_idx])[:, 1]
+                pred = np.clip(pred, 1e-7, 1 - 1e-7)
+                scores.append(log_loss(y_tune[val_idx], pred))
+            return np.mean(scores)
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=n_trials)
+
+        best = study.best_params
+        self.best_params = {"lgb": best}
+
+        # Save best params with model
+        if self.model:
+            self._save_model()
+
+        return {
+            "status": "ok",
+            "best_params": best,
+            "best_log_loss": round(study.best_value, 4),
+            "n_trials": n_trials,
+        }
+
+    # ── Predict ────────────────────────────────────────────────────
+
     async def predict_course(self, session: AsyncSession, course: Course) -> list[dict]:
-        """
-        Prédit les probabilités de victoire pour chaque partant d'une course.
-        Retourne une liste triée par probabilité décroissante.
-        """
+        """Prédit les probabilités de victoire pour chaque partant."""
         if self.model is None:
             logger.warning("Aucun modèle entraîné, utilisation de la baseline (cote)")
             return await self._baseline_predict(session, course)
@@ -172,14 +505,36 @@ class HippiquePredictor:
             return []
 
         X = np.array([r["features"] for r in rows])
-        probas = self.model.predict_proba(X)[:, 1]
+
+        # Get probabilities from ensemble
+        if isinstance(self.model, list):
+            blend = self._blend_predict(self.model, self.ensemble_weights or [1.0], X)
+            if self.calibrator:
+                probas = self.calibrator.transform(blend)
+            else:
+                probas = blend
+        else:
+            # Legacy model
+            probas = self.model.predict_proba(X)[:, 1]
+
+        # Get rankings from ranker if available
+        rank_scores = None
+        if self.ranker:
+            try:
+                rank_scores = self.ranker.predict(X)
+            except Exception:
+                rank_scores = None
 
         results = []
         for i, row in enumerate(rows):
             prob = float(probas[i])
             cote = row["features"][0]  # cote_probable
-            prob_implicite = 1.0 / max(cote, 1.0)
-            is_value = prob > prob_implicite * 1.2  # 20% de marge pour value bet
+            # Guard NaN for value bet
+            if np.isnan(cote) or np.isnan(prob):
+                is_value = False
+            else:
+                prob_implicite = 1.0 / max(cote, 1.0)
+                is_value = prob > prob_implicite * 1.2
 
             results.append({
                 "partant_id": row["partant_id"],
@@ -187,16 +542,16 @@ class HippiquePredictor:
                 "numero": row["numero"],
                 "probabilite": prob,
                 "is_value_bet": is_value,
+                "_rank_score": float(rank_scores[i]) if rank_scores is not None else prob,
             })
 
-        # Trier par probabilité décroissante
-        results.sort(key=lambda x: -x["probabilite"])
+        # Sort by ranker score (uses LambdaRank if available)
+        results.sort(key=lambda x: -x["_rank_score"])
 
-        # Attribuer les rangs et scores de confiance
-        total_prob = sum(r["probabilite"] for r in results)
+        total_prob = sum(r["probabilite"] for r in results if not np.isnan(r["probabilite"]))
         for rank, r in enumerate(results, 1):
             r["rang_predit"] = rank
-            # Score de confiance : écart relatif entre le 1er et le 2ème
+            del r["_rank_score"]
             if rank == 1 and len(results) > 1:
                 ecart = r["probabilite"] - results[1]["probabilite"]
                 r["score_confiance"] = min(round(ecart / max(r["probabilite"], 0.01) * 100, 0), 100)
@@ -251,7 +606,6 @@ class HippiquePredictor:
         cheval = (await session.execute(cheval_stmt)).scalar_one_or_none()
         cheval_nom = cheval.nom if cheval else "Inconnu"
 
-        # Récupérer historique récent
         hist_stmt = (
             select(Partant)
             .join(Course)
@@ -317,10 +671,7 @@ class HippiquePredictor:
 
     async def backtest_course(self, session: AsyncSession, course: Course):
         """Met à jour les prédictions d'une course terminée avec les résultats réels."""
-        stmt = (
-            select(Prediction)
-            .where(Prediction.course_id == course.id)
-        )
+        stmt = select(Prediction).where(Prediction.course_id == course.id)
         result = await session.execute(stmt)
         preds = result.scalars().all()
 
@@ -332,12 +683,11 @@ class HippiquePredictor:
             if not partant:
                 continue
 
-            # classement None = hors podium (non classé dans les rapports PMU)
             classement = partant.classement
             pred.resultat_gagnant = classement == 1
             pred.resultat_place = classement is not None and 1 <= classement <= 3
 
-            if pred.rang_predit == 1:  # On ne parie que sur notre favori
+            if pred.rang_predit == 1:
                 if pred.resultat_gagnant and partant.rapport_gagnant:
                     pred.gain_gagnant = partant.rapport_gagnant - mise
                 else:

@@ -57,6 +57,26 @@ class PMUCollector:
         data = resp.json()
         return data.get("participants", [])
 
+    async def get_pronostics(self, d: date, reunion: int, course: int) -> list[dict]:
+        url = f"{BASE}/programme/{_date_fmt(d)}/R{reunion}/C{course}/pronostics"
+        resp = await self.client.get(url)
+        if resp.status_code != 200:
+            return []
+        try:
+            data = resp.json()
+            # Chercher le pronostic Equidia (ou le premier disponible)
+            for prono in data if isinstance(data, list) else data.get("pronostics", []):
+                if prono.get("editeur", "").upper() in ("EQUIDIA", "PARIS TURF", ""):
+                    return prono.get("chevaux", prono.get("pronostics", []))
+            # Fallback: premier pronostic disponible
+            pronostics = data if isinstance(data, list) else data.get("pronostics", [])
+            if pronostics:
+                first = pronostics[0]
+                return first.get("chevaux", first.get("pronostics", []))
+            return []
+        except Exception:
+            return []
+
     async def get_rapports(self, d: date, reunion: int, course: int) -> list[dict]:
         url = f"{BASE}/programme/{_date_fmt(d)}/R{reunion}/C{course}/rapports-definitifs"
         resp = await self.client.get(url)
@@ -90,11 +110,24 @@ class PMUCollector:
 
     # ── Persist to DB ─────────────────────────────────────────
 
+    @staticmethod
+    def _extract_gains_carriere(p: dict) -> float | None:
+        gains = p.get("gainsParticipant", {})
+        if isinstance(gains, dict):
+            gc = gains.get("gainsCarriere")
+            if gc is not None:
+                return float(gc) / 100  # centimes → euros
+        gc = p.get("gainsCarriere")
+        if gc is not None:
+            return float(gc) / 100
+        return None
+
     async def _get_or_create_cheval(self, session: AsyncSession, p: dict) -> Cheval:
         nom = p.get("nom", "INCONNU")
         stmt = select(Cheval).where(Cheval.nom == nom)
         result = await session.execute(stmt)
         cheval = result.scalar_one_or_none()
+        gains = self._extract_gains_carriere(p)
         if cheval is None:
             cheval = Cheval(
                 nom=nom,
@@ -104,12 +137,15 @@ class PMUCollector:
                 pere=p.get("nomPere"),
                 mere=p.get("nomMere"),
                 proprietaire=p.get("proprietaire"),
+                gains_carriere=gains,
             )
             session.add(cheval)
             await session.flush()
         else:
             if p.get("age"):
                 cheval.age = p["age"]
+            if gains is not None:
+                cheval.gains_carriere = gains
         return cheval
 
     async def _get_or_create_jockey(self, session: AsyncSession, nom: str) -> Jockey:
@@ -218,6 +254,18 @@ class PMUCollector:
                             cote_depart=cote_direct,
                         )
                         session.add(partant)
+
+                    # Récupérer les pronostics Equidia
+                    pronostics = await self.get_pronostics(d, num_reunion, num_course)
+                    if pronostics:
+                        await session.flush()
+                        stmt_prono = select(Partant).where(Partant.course_id == course.id)
+                        prono_result = await session.execute(stmt_prono)
+                        partants_prono = {pt.numero: pt for pt in prono_result.scalars().all()}
+                        for rang, prono in enumerate(pronostics, 1):
+                            num = prono.get("numPmu") or prono.get("numero")
+                            if num and num in partants_prono:
+                                partants_prono[num].rang_pronostic = rang
 
                     # Récupérer les résultats si la course est terminée
                     rapports = await self.get_rapports(d, num_reunion, num_course)
@@ -330,6 +378,24 @@ class PMUCollector:
                                 # Statut (NON_PARTANT tardif)
                                 if p.get("statut") == "NON_PARTANT":
                                     partant.statut = "NON_PARTANT"
+                                # Update gains_carriere
+                                gains = self._extract_gains_carriere(p)
+                                if gains is not None and partant.cheval_id:
+                                    cheval_stmt = select(Cheval).where(Cheval.id == partant.cheval_id)
+                                    cheval = (await session.execute(cheval_stmt)).scalar_one_or_none()
+                                    if cheval:
+                                        cheval.gains_carriere = gains
+
+                        # Pronostics Equidia
+                        pronostics = await self.get_pronostics(d, num_reunion, num_course)
+                        if pronostics:
+                            stmt_prono = select(Partant).where(Partant.course_id == existing.id)
+                            prono_result = await session.execute(stmt_prono)
+                            partants_prono = {pt.numero: pt for pt in prono_result.scalars().all()}
+                            for rang, prono in enumerate(pronostics, 1):
+                                num = prono.get("numPmu") or prono.get("numero")
+                                if num and num in partants_prono:
+                                    partants_prono[num].rang_pronostic = rang
 
                         # Vérifier si la course est terminée
                         rapports = await self.get_rapports(d, num_reunion, num_course)
@@ -400,6 +466,18 @@ class PMUCollector:
                                 cote_depart=cote_direct,
                             )
                             session.add(partant)
+
+                        # Pronostics Equidia
+                        pronostics = await self.get_pronostics(d, num_reunion, num_course)
+                        if pronostics:
+                            await session.flush()
+                            stmt_prono = select(Partant).where(Partant.course_id == course.id)
+                            prono_result = await session.execute(stmt_prono)
+                            partants_prono = {pt.numero: pt for pt in prono_result.scalars().all()}
+                            for rang, prono in enumerate(pronostics, 1):
+                                num = prono.get("numPmu") or prono.get("numero")
+                                if num and num in partants_prono:
+                                    partants_prono[num].rang_pronostic = rang
 
                         rapports = await self.get_rapports(d, num_reunion, num_course)
                         if rapports and not isinstance(rapports, dict):

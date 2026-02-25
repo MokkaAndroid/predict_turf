@@ -24,6 +24,7 @@ class Partant(Base):
     rapport_gagnant: Mapped[float | None] = mapped_column(Float)  # rapport pour 1€ en gagnant
     rapport_place: Mapped[float | None] = mapped_column(Float)  # rapport pour 1€ en placé
     statut: Mapped[str] = mapped_column(String(20), default="PARTANT")  # PARTANT, NON_PARTANT, DISQUALIFIE
+    rang_pronostic: Mapped[int | None] = mapped_column(Integer)  # rang dans les pronostics Equidia
 
     course: Mapped["Course"] = relationship(back_populates="partants")
     cheval: Mapped["Cheval"] = relationship(back_populates="participations")

@@ -1,4 +1,4 @@
-from sqlalchemy import String, Integer
+from sqlalchemy import String, Integer, Float
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -15,5 +15,6 @@ class Cheval(Base):
     pere: Mapped[str | None] = mapped_column(String(100))
     mere: Mapped[str | None] = mapped_column(String(100))
     proprietaire: Mapped[str | None] = mapped_column(String(200))
+    gains_carriere: Mapped[float | None] = mapped_column(Float)
 
     participations: Mapped[list["Partant"]] = relationship(back_populates="cheval")

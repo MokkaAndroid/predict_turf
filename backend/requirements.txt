@@ -16,3 +16,5 @@ lightgbm==4.5.0
 joblib==1.4.2
 apscheduler==3.11.0
 aiosqlite==0.20.0
+optuna>=3.5
+catboost>=1.2
