@@ -111,7 +111,7 @@ export default function Dashboard() {
       </div>
 
       {stats ? (
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
           <StatCard label="Courses analysees" value={stats.total_courses} sub={`depuis le ${new Date(dateFrom).toLocaleDateString('fr-FR')}`} icon={BarChart3} positive />
           <StatCard
             label="Taux gagnant"
@@ -133,6 +133,20 @@ export default function Dashboard() {
             sub={`P&L: ${stats.profit_gagnant > 0 ? '+' : ''}${stats.profit_gagnant} EUR`}
             icon={stats.roi_gagnant > 0 ? TrendingUp : TrendingDown}
             positive={stats.roi_gagnant > 0}
+          />
+          <StatCard
+            label="ROI Place"
+            value={`${stats.roi_place > 0 ? '+' : ''}${stats.roi_place}%`}
+            sub={`P&L: ${stats.profit_place > 0 ? '+' : ''}${stats.profit_place} EUR`}
+            icon={stats.roi_place > 0 ? TrendingUp : TrendingDown}
+            positive={stats.roi_place > 0}
+          />
+          <StatCard
+            label="ROI Global"
+            value={`${(stats.profit_gagnant + stats.profit_place) > 0 ? '+' : ''}${(((stats.profit_gagnant + stats.profit_place) / (stats.courses_predites * stats.mise_unitaire * 2)) * 100).toFixed(1)}%`}
+            sub={`P&L: ${(stats.profit_gagnant + stats.profit_place) > 0 ? '+' : ''}${(stats.profit_gagnant + stats.profit_place).toFixed(2)} EUR`}
+            icon={(stats.profit_gagnant + stats.profit_place) > 0 ? TrendingUp : TrendingDown}
+            positive={(stats.profit_gagnant + stats.profit_place) > 0}
           />
         </div>
       ) : (
