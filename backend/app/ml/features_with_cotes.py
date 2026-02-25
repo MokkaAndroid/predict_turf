@@ -1,10 +1,9 @@
 """
 Feature engineering pour la prédiction hippique (Plat).
 Chaque partant dans une course est transformé en vecteur de features.
-33 features au total (sans features de cotes) :
-  8 base + 8 DB + 2 tendance + 4 interactions + 3 forme avancée
-  + 2 hippodrome + 2 relatives + 1 Equidia = 33
-  (backup avec cotes : features_with_cotes.py)
+39 features au total :
+  14 corrigées + 8 DB + 3 tendance + 4 relatives + 1 Equidia
+  + 4 interactions + 3 forme avancée + 2 hippodrome = 39
 """
 import logging
 import math
@@ -52,7 +51,9 @@ _CONDITION_LEVELS = {
 }
 
 FEATURE_NAMES = [
-    # ── Base (8, sans cotes) ──
+    # ── Originales (14, corrigées) ──
+    "cote_probable",
+    "cote_depart",
     "poids",
     "nombre_courses",
     "win_rate",
@@ -64,7 +65,8 @@ FEATURE_NAMES = [
     "distance_affinite",
     "gains_carriere_log",
     "nb_partants",
-    # ── DB (8) ──
+    "prob_implicite_cote",
+    # ── Nouvelles DB (8) ──
     "surface",              # HERBE=0, PSF=1
     "condition_piste",      # ordinal 0–3
     "dotation_log",         # log1p(dotation)
@@ -73,7 +75,8 @@ FEATURE_NAMES = [
     "sexe",                 # F=0, M=1, H=2
     "surface_affinite",     # win_rate sur cette surface
     "condition_affinite",   # win_rate sur cette condition
-    # ── Tendance & dernière perf (2) ──
+    # ── Tendance & dernière perf (3) ──
+    "tendance_cote",        # cote_depart - cote_probable
     "dernier_classement",   # classement dernière course
     "regularite",           # écart-type classements récents
     # ── Interactions (4) ──
@@ -88,7 +91,9 @@ FEATURE_NAMES = [
     # ── Hippodrome (2) ──
     "hippodrome_favori_winrate",  # target encoding: win rate du favori cote sur cet hippodrome
     "cheval_hippodrome_winrate",  # win rate du cheval sur cet hippodrome
-    # ── Relatives intra-course (2, sans cotes) ──
+    # ── Relatives intra-course (4) ──
+    "rang_cote",            # rang cote dans la course (1=favori)
+    "ecart_cote_favori",    # écart avec le favori
     "win_rate_relatif",     # win_rate - moyenne course
     "poids_relatif",        # poids - moyenne course
     # ── Pronostics (1) ──
@@ -189,18 +194,23 @@ async def _hippodrome_favori_winrate(session: AsyncSession, course: Course) -> f
 
 
 def _add_relative_features(rows: list[dict]):
-    """Calcule les 2 features relatives à la course et les ajoute au vecteur."""
+    """Calcule les 4 features relatives à la course et les ajoute au vecteur."""
     if not rows:
         return
 
-    idx_winrate = 2    # win_rate (position dans le nouveau vecteur)
-    idx_poids = 0      # poids
+    idx_cote = 0       # cote_probable
+    idx_winrate = 4    # win_rate
+    idx_poids = 2      # poids
 
     # Collecter les valeurs non-NaN
+    cotes = []
     win_rates = []
     poids_list = []
     for row in rows:
         f = row["features"]
+        c = f[idx_cote]
+        if not math.isnan(c):
+            cotes.append(c)
         wr = f[idx_winrate]
         if not math.isnan(wr):
             win_rates.append(wr)
@@ -208,13 +218,28 @@ def _add_relative_features(rows: list[dict]):
         if not math.isnan(p):
             poids_list.append(p)
 
+    sorted_cotes = sorted(cotes)
     mean_winrate = np.mean(win_rates) if win_rates else 0.0
     mean_poids = np.mean(poids_list) if poids_list else float("nan")
+    min_cote = sorted_cotes[0] if sorted_cotes else float("nan")
 
     for row in rows:
         f = row["features"]
+        cote = f[idx_cote]
         wr = f[idx_winrate]
         poids = f[idx_poids]
+
+        # rang_cote
+        if not math.isnan(cote) and sorted_cotes:
+            rang_cote = float(sorted_cotes.index(cote) + 1)
+        else:
+            rang_cote = float("nan")
+
+        # ecart_cote_favori
+        if not math.isnan(cote) and not math.isnan(min_cote):
+            ecart_cote_favori = cote - min_cote
+        else:
+            ecart_cote_favori = float("nan")
 
         # win_rate_relatif
         if not math.isnan(wr):
@@ -230,7 +255,7 @@ def _add_relative_features(rows: list[dict]):
 
         # Pop the last element (rang_prono_equidia), insert relatives, re-add prono
         prono = f.pop()
-        f.extend([win_rate_relatif, poids_relatif])
+        f.extend([rang_cote, ecart_cote_favori, win_rate_relatif, poids_relatif])
         f.append(prono)
 
 
@@ -471,6 +496,14 @@ async def _compute_features(
     else:
         gains_log = float("nan")
 
+    # ── Cote et probabilité implicite ─────────────────────
+    cote_prob = float(partant.cote_probable) if partant.cote_probable else float("nan")
+    cote_dep = float(partant.cote_depart) if partant.cote_depart else cote_prob
+    if not math.isnan(cote_prob) and cote_prob >= 1.0:
+        prob_implicite = 1.0 / cote_prob
+    else:
+        prob_implicite = float("nan")
+
     nb_partants = float(course.nombre_partants) if course.nombre_partants else float("nan")
 
     # ── Nouvelles features DB ─────────────────────────────
@@ -575,6 +608,11 @@ async def _compute_features(
             c_wins = (await session.execute(c_wins_stmt)).scalar() or 0
             condition_aff = c_wins / c_total
 
+    # ── Tendance cote ─────────────────────────────────────
+    tendance_cote = float("nan")
+    if not math.isnan(cote_dep) and not math.isnan(cote_prob):
+        tendance_cote = cote_dep - cote_prob
+
     # ── Cheval×Hippodrome win rate (Point 3) ──────────────
     cheval_hippo_wr = float("nan")
     if partant.cheval_id and course.hippodrome:
@@ -610,7 +648,9 @@ async def _compute_features(
     poids_val = float(partant.poids) if partant.poids else float("nan")
 
     return [
-        # ── Base (11, sans cotes) ──
+        # ── Originales (14) ──
+        cote_prob,
+        cote_dep,
         poids_val,
         float(nb_courses),
         win_rate,
@@ -622,6 +662,7 @@ async def _compute_features(
         distance_aff,
         gains_log,
         nb_partants,
+        prob_implicite,
         # ── DB (8) ──
         surface_val,
         condition_val,
@@ -631,7 +672,8 @@ async def _compute_features(
         sexe_val,
         surface_aff,
         condition_aff,
-        # ── Tendance (2) ──
+        # ── Tendance (3) ──
+        tendance_cote,
         dernier_classement,
         regularite,
         # ── Interactions (4) ──
